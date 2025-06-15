@@ -1,0 +1,64 @@
+# Electric Push Cart Controller - Requirements
+# ==========================================
+# Raspberry Pi Zero 2 W based electric push cart with ODrive motor control
+# RC control via HOTRC DS600, optional MPU6050 tilt sensing
+
+# Core Dependencies
+# -----------------
+
+# ODrive motor controller communication
+odrive>=0.6.4,<0.7.0
+
+# Raspberry Pi GPIO control for RC input reading
+RPi.GPIO>=0.7.1
+
+# Mathematical operations (required by ODrive and control algorithms)
+numpy>=1.21.0,<2.0.0
+
+# Serial communication with motor controllers
+pyserial>=3.5,<4.0
+
+# Sensor Communication (Optional)
+# -------------------------------
+
+# I2C communication for MPU6050 accelerometer/gyroscope
+smbus2>=0.4.2
+
+# Threading and timing utilities (usually built-in, listed for completeness)
+# threading - built-in
+# time - built-in
+# math - built-in
+
+# Development and Debugging (Optional)
+# ------------------------------------
+
+# Enhanced terminal output colors
+# colorama>=0.4.6
+
+# System Requirements (install via apt)
+# ------------------------------------
+# These should be installed via apt-get on Raspberry Pi OS:
+#
+# sudo apt update
+# sudo apt install -y python3-pip python3-dev python3-smbus python3-rpi.gpio
+# sudo apt install -y i2c-tools python3-numpy
+#
+# For ODrive USB communication:
+# sudo apt install -y libusb-1.0-0-dev
+
+# Installation Instructions
+# ------------------------
+# 1. Update system: sudo apt update && sudo apt upgrade -y
+# 2. Install system packages: sudo apt install -y python3-pip python3-dev python3-smbus python3-rpi.gpio i2c-tools libusb-1.0-0-dev
+# 3. Install Python packages: pip3 install -r requirements.txt
+# 4. Enable I2C: sudo raspi-config -> Interface Options -> I2C -> Enable
+# 5. Add user to dialout group: sudo usermod -a -G dialout $USER
+# 6. Reboot: sudo reboot
+
+# Hardware Requirements
+# --------------------
+# - Raspberry Pi Zero 2 W
+# - 2x ODrive motor controllers
+# - HOTRC DS600 RC transmitter/receiver
+# - MPU6050 IMU (optional)
+# - Appropriate motors and wheels 
