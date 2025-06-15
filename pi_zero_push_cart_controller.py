@@ -291,6 +291,16 @@ class PushCartController:
         self.left_serial = 0x395833613233   # Left side ODrive
         self.right_serial = 0x3959335e3233  # Right side ODrive
         
+        # USB Connection Monitoring
+        self.last_left_connection_check = time.time()
+        self.last_right_connection_check = time.time()
+        self.connection_check_interval = 1.0  # Check connections every 1 second
+        self.reconnection_in_progress = False
+        self.reconnection_attempts = 0
+        self.max_reconnection_attempts = 3
+        self.last_reconnection_attempt = 0
+        self.reconnection_cooldown = 10.0  # Wait 10 seconds between reconnection attempts
+        
         self.mpu6050 = None
         self.emergency_stop = False
         self.running = False
@@ -435,7 +445,7 @@ class PushCartController:
         return ready_count > 0
     
     def set_motor_velocities(self, left_vel, right_vel):
-        """Set motor velocities with safety checks and direction correction"""
+        """Set motor velocities with safety checks, direction correction, and USB error handling"""
         # Safety checks
         if self.emergency_stop:
             left_vel = right_vel = 0.0
@@ -450,26 +460,43 @@ class PushCartController:
         left_vel = max(-self.max_velocity, min(self.max_velocity, left_vel))
         right_vel = max(-self.max_velocity, min(self.max_velocity, right_vel))
         
-        try:
-            if self.left_motor:
+        # Handle left motor
+        if self.left_motor:
+            try:
                 # Check motor state before sending command
                 left_state = self.left_motor.axis0.current_state
                 if left_state != 8:  # Not in closed loop
                     print(f"⚠️  Left motor not in closed loop (state: {left_state})")
                 else:
                     self.left_motor.axis0.controller.input_vel = left_vel
-                    
-            if self.right_motor:
+            except Exception as e:
+                print(f"❌ Left motor USB error: {e}")
+                self.left_motor = None  # Mark as disconnected
+                if not self.emergency_stop:
+                    print("🚨 Left motor communication failed - entering emergency stop")
+                    self.emergency_stop = True
+        
+        # Handle right motor  
+        if self.right_motor:
+            try:
                 # Check motor state before sending command  
                 right_state = self.right_motor.axis0.current_state
                 if right_state != 8:  # Not in closed loop
                     print(f"⚠️  Right motor not in closed loop (state: {right_state})")
                 else:
                     self.right_motor.axis0.controller.input_vel = right_vel
-                
-        except Exception as e:
-            print(f"❌ Motor control error: {e}")
-            self.emergency_stop = True
+            except Exception as e:
+                print(f"❌ Right motor USB error: {e}")
+                self.right_motor = None  # Mark as disconnected
+                if not self.emergency_stop:
+                    print("🚨 Right motor communication failed - entering emergency stop")
+                    self.emergency_stop = True
+        
+        # If both motors are disconnected, trigger emergency stop
+        if self.left_motor is None and self.right_motor is None:
+            if not self.emergency_stop:
+                print("🚨 All motors disconnected - entering emergency stop")
+                self.emergency_stop = True
     
     def calculate_motor_speeds(self, throttle, steering):
         """Convert throttle/steering to left/right motor speeds with proper differential steering"""
@@ -512,9 +539,12 @@ class PushCartController:
         return left_speed, right_speed
     
     def safety_monitor(self):
-        """Monitor tilt and other safety conditions"""
+        """Monitor tilt, RC connection, and USB connections"""
         while self.running:
             try:
+                # USB Connection monitoring (most important for stability)
+                self.monitor_usb_connections()
+                
                 # MPU6050 tilt monitoring commented out for now
                 # if self.mpu6050:
                 #     pitch, roll = self.mpu6050.get_tilt_angle()
@@ -536,6 +566,155 @@ class PushCartController:
             except Exception as e:
                 print(f"❌ Safety monitor error: {e}")
                 time.sleep(1)
+    
+    def check_motor_connection(self, motor, name):
+        """Check if a motor is still connected and responsive"""
+        if motor is None:
+            return False
+        
+        try:
+            # Try to read a simple property to test connection
+            _ = motor.serial_number
+            _ = motor.axis0.current_state
+            return True
+        except Exception as e:
+            print(f"⚠️  {name} motor connection lost: {e}")
+            return False
+    
+    def attempt_motor_reconnection(self):
+        """Attempt to reconnect to disconnected motors"""
+        if self.reconnection_in_progress:
+            return False
+        
+        current_time = time.time()
+        if current_time - self.last_reconnection_attempt < self.reconnection_cooldown:
+            return False
+        
+        if self.reconnection_attempts >= self.max_reconnection_attempts:
+            print(f"❌ Maximum reconnection attempts ({self.max_reconnection_attempts}) reached")
+            return False
+        
+        print("🔄 Attempting to reconnect to ODrive controllers...")
+        self.reconnection_in_progress = True
+        self.last_reconnection_attempt = current_time
+        self.reconnection_attempts += 1
+        
+        try:
+            # Clear existing references
+            disconnected_motors = []
+            if not self.check_motor_connection(self.left_motor, "Left"):
+                self.left_motor = None
+                disconnected_motors.append("Left")
+            if not self.check_motor_connection(self.right_motor, "Right"):
+                self.right_motor = None
+                disconnected_motors.append("Right")
+            
+            if not disconnected_motors:
+                print("✅ All motors still connected")
+                self.reconnection_in_progress = False
+                return True
+            
+            print(f"🔍 Reconnecting to: {', '.join(disconnected_motors)}")
+            
+            # Try to find ODrives again
+            odrives = odrive.find_any(count=2, timeout=8)
+            
+            if odrives is None:
+                print("❌ No ODrives found during reconnection")
+                self.reconnection_in_progress = False
+                return False
+            
+            # Convert to list if needed
+            if not isinstance(odrives, (list, tuple)):
+                odrives = [odrives]
+            elif isinstance(odrives, tuple):
+                odrives = list(odrives)
+            
+            # Re-identify motors by serial number
+            reconnected = []
+            for odrv in odrives:
+                try:
+                    serial = odrv.serial_number
+                    if serial == self.left_serial and self.left_motor is None:
+                        self.left_motor = odrv
+                        print(f"🔌 Left motor reconnected")
+                        reconnected.append("Left")
+                    elif serial == self.right_serial and self.right_motor is None:
+                        self.right_motor = odrv
+                        print(f"🔌 Right motor reconnected") 
+                        reconnected.append("Right")
+                except Exception as e:
+                    print(f"❌ Error identifying ODrive: {e}")
+            
+            # Re-initialize reconnected motors
+            success = True
+            for motor, name in [(self.left_motor, "Left"), (self.right_motor, "Right")]:
+                if motor and name in reconnected:
+                    try:
+                        state = motor.axis0.current_state
+                        if state != 8:  # Not in closed loop
+                            print(f"   Setting {name} motor to closed loop...")
+                            motor.axis0.requested_state = 8
+                            time.sleep(2)
+                        
+                        if motor.axis0.current_state == 8:
+                            print(f"   ✅ {name} motor reinitialized")
+                        else:
+                            print(f"   ❌ {name} motor failed to reinitialize")
+                            success = False
+                    except Exception as e:
+                        print(f"   ❌ {name} motor reinit error: {e}")
+                        success = False
+            
+            if success and reconnected:
+                print(f"🎉 Successfully reconnected: {', '.join(reconnected)}")
+                self.reconnection_attempts = 0  # Reset counter on success
+                # Don't clear emergency_stop here - let safety monitor handle it
+            else:
+                print("❌ Reconnection failed")
+            
+            self.reconnection_in_progress = False
+            return success
+            
+        except Exception as e:
+            print(f"❌ Reconnection error: {e}")
+            self.reconnection_in_progress = False
+            return False
+    
+    def monitor_usb_connections(self):
+        """Monitor USB connections and trigger reconnection if needed"""
+        current_time = time.time()
+        
+        # Check connections at specified interval
+        if current_time - self.last_left_connection_check >= self.connection_check_interval:
+            if not self.check_motor_connection(self.left_motor, "Left"):
+                self.left_motor = None
+                if not self.emergency_stop:
+                    print("🚨 Left motor disconnected - entering emergency stop")
+                self.emergency_stop = True
+                
+        if current_time - self.last_right_connection_check >= self.connection_check_interval:
+            if not self.check_motor_connection(self.right_motor, "Right"):
+                self.right_motor = None
+                if not self.emergency_stop:
+                    print("🚨 Right motor disconnected - entering emergency stop")
+                self.emergency_stop = True
+        
+        # Attempt reconnection if in emergency stop due to disconnection
+        if self.emergency_stop and (self.left_motor is None or self.right_motor is None):
+            if self.attempt_motor_reconnection():
+                # Check if we have at least one working motor
+                working_motors = sum([self.left_motor is not None, self.right_motor is not None])
+                if working_motors > 0:
+                    print("🟡 Partial reconnection successful - clearing emergency stop")
+                    self.emergency_stop = False
+                elif working_motors == 2:
+                    print("🟢 Full reconnection successful - clearing emergency stop")
+                    self.emergency_stop = False
+        
+        # Update check timestamps
+        self.last_left_connection_check = current_time
+        self.last_right_connection_check = current_time
     
     def run(self):
         """Main control loop"""
@@ -630,6 +809,19 @@ class PushCartController:
                             print(f"📊 [MANUAL] T:{throttle:.2f}({throttle_pct:+.0f}%) S:{steering:.2f}({steering_pct:+.0f}%) | "
                                   f"L:{left_speed:.1f} R:{right_speed:.1f} | "
                                   f"PWM: T:{raw_throttle} S:{raw_steering} | Signal:{signal_strength}")
+                            
+                            # USB Connection Status
+                            left_status = "✅" if self.left_motor else "❌"
+                            right_status = "✅" if self.right_motor else "❌"
+                            emergency_status = "🚨 STOP" if self.emergency_stop else "🟢 OK"
+                            
+                            connection_info = f"USB: L{left_status} R{right_status} | Status:{emergency_status}"
+                            if self.reconnection_attempts > 0:
+                                connection_info += f" | Reconnect:{self.reconnection_attempts}/{self.max_reconnection_attempts}"
+                            if self.reconnection_in_progress:
+                                connection_info += " | 🔄 Reconnecting..."
+                            
+                            print(f"🔌 {connection_info}")
                             
                             # Motor diagnostics - show actual motor status
                             try:
