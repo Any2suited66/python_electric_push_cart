@@ -23,9 +23,9 @@ This project transforms a standard golf push cart into a motorized, remote-contr
 - **HotRC DS600 Joystick** - Single-axis controller with tank-style steering
 
 ### Power & Safety
-- **12V Battery Pack** - Powers hoverboard motors
+- **36V Battery Pack** - Powers hoverboard motors
 - **5V Power Supply** - Powers Raspberry Pi and ESP32s
-- **Emergency Stop System** - RC controller with PWM-based safety cutoff
+- **Emergency Stop System** - ESP-NOW signal loss detection with automatic stop
 
 ## 🔧 Hardware Setup
 
@@ -34,7 +34,7 @@ This project transforms a standard golf push cart into a motorized, remote-contr
 Hoverboard Motors:
 ├── Left Motor:  UART TX (GPIO 14) → Motor Controller
 ├── Right Motor: UART RX (GPIO 15) → Motor Controller
-└── Power:       12V Battery → Motor Controllers
+└── Power:       36V Battery → Motor Controllers
 ```
 
 ### ESP32 Pinout
@@ -42,7 +42,6 @@ Hoverboard Motors:
 Controller ESP32:
 ├── GPIO 20: X-axis (Steering)
 ├── GPIO 16: Y-axis (Speed/Throttle)
-├── GPIO 21: RC Emergency Stop (PWM)
 └── USB:     Power and data to receiver
 
 Receiver ESP32:
@@ -59,21 +58,20 @@ Raspberry Pi Zero 2W:
 └── Power:             5V supply
 ```
 
-## 📁 Project Structure
 
-```
-python_uart_cart/
-├── controller/
-│   └── controller.ino          # ESP32 controller firmware
-├── hoverboard_minimal.py       # Main Python control script
-├── hoverboard_controller.py    # Reference implementation
-├── test_hoverboard.py          # Simple test script
-└── README.md                   # This file
-```
 
 ## 🚀 Quick Start
 
-### 1. Flash ESP32 Firmware
+### 1. Flash Hoverboard Firmware
+
+**Hoverboard Motor Controllers:**
+```bash
+# Flash the custom FOC firmware from EFeru's repository
+# https://github.com/EFeru/hoverboard-firmware-hack-FOC
+# This provides Field Oriented Control for smooth motor operation
+```
+
+### 2. Flash ESP32 Firmware
 
 **Controller ESP32:**
 ```bash
@@ -87,7 +85,7 @@ python_uart_cart/
 # This receives data and forwards to Raspberry Pi via USB
 ```
 
-### 2. Install Dependencies
+### 3. Install Dependencies
 
 ```bash
 # Install Python serial library
@@ -97,7 +95,7 @@ pip install pyserial
 sudo apt-get install python3-serial
 ```
 
-### 3. Run the Controller
+### 4. Run the Controller
 
 ```bash
 # Run the main control script
@@ -121,7 +119,7 @@ python3 hoverboard_controller.py
 - **Parking Mode**: 30% max speed
 
 ### Safety Features
-- **Emergency Stop**: RC controller PWM signal (<1400μs = normal, >1500μs = stop)
+- **Emergency Stop**: ESP-NOW signal loss detection with automatic stop
 - **Signal Loss Protection**: Automatic stop after 3 seconds of no data
 - **Joystick Deadzone**: Prevents motor jitter from small movements
 - **Smooth Acceleration**: Configurable acceleration/deceleration rates
@@ -190,14 +188,14 @@ sudo usermod -a -G dialout $USER
 ## 🔒 Safety Considerations
 
 ### Critical Safety Features
-- **Emergency Stop**: Always functional via RC controller
+- **Emergency Stop**: Always functional via ESP-NOW signal loss detection
 - **Signal Loss Protection**: Automatic stop on communication failure
 - **Speed Limits**: Configurable maximum speeds for each mode
 - **EMI Shielding**: Aluminum foil around hoverboard motherboard
 
 ### Operating Guidelines
 - Always test in open area first
-- Keep emergency stop controller accessible
+- Keep ESP32 controller accessible for emergency stop
 - Monitor battery levels
 - Check all connections before use
 - Start in low-speed modes
@@ -208,13 +206,12 @@ sudo usermod -a -G dialout $USER
 - **Max Speed**: ~15-20 mph (configurable)
 - **Control Range**: ~100m (ESP32 wireless)
 - **Response Time**: <50ms
-- **Battery Life**: 2-4 hours (depending on usage)
+- **Battery Life**: 6-8 hours (depending on usage)
 
 ### Communication Protocol
 - **ESP-NOW**: Direct wireless between ESP32s
 - **UART**: 9600 baud to hoverboard motors
 - **USB Serial**: 115200 baud to Raspberry Pi
-- **PWM**: Emergency stop signal (700-2300μs range)
 
 ### Hoverboard Protocol
 ```
