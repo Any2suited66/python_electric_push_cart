@@ -14,7 +14,7 @@
 // Pin Definitions
 #define JOYSTICK_X_PIN 32  // PS4 joystick X-axis
 #define JOYSTICK_Y_PIN 33  // PS4 joystick Y-axis
-#define JOYSTICK_BUTTON_PIN 34  // PS4 joystick button press
+#define JOYSTICK_BUTTON_PIN 4  // PS4 joystick button press
 #define BUTTON_1_PIN 25    // Button 1
 #define BUTTON_2_PIN 26    // Button 2
 #define BUTTON_3_PIN 27    // Button 3
@@ -105,11 +105,19 @@ uint8_t current_channel_index = 0;
 unsigned long last_channel_switch = 0;
 const unsigned long CHANNEL_SWITCH_COOLDOWN = 30000; // 30 seconds between channel switches
 
-// Button states
+// Button states with enhanced debouncing
 bool button_states[5] = {false, false, false, false, false};
 bool last_button_states[5] = {false, false, false, false, false};
 bool joystick_button_state = false;
 bool last_joystick_button_state = false;
+
+// Enhanced button debouncing variables
+unsigned long button_debounce_times[5] = {0, 0, 0, 0, 0};
+unsigned long joystick_button_debounce_time = 0;
+const unsigned long BUTTON_DEBOUNCE_DELAY = 50; // 50ms debounce
+int button_stable_readings[5] = {0, 0, 0, 0, 0};
+int joystick_button_stable_readings = 0;
+const int REQUIRED_STABLE_READINGS = 5; // Need 5 stable readings to confirm state
 
 // Button connection status
 bool button_connected[5] = {true, true, true, true, true};
@@ -124,6 +132,11 @@ enum OperationMode {
 };
 
 OperationMode current_mode = MODE_NORMAL;
+
+// Toggle features
+bool emergency_stop_enabled = false;
+bool debug_mode_enabled = false;
+bool auto_reconnect_enabled = true;
 
 // Gesture control state
 bool gesture_control_enabled = false;
@@ -180,18 +193,26 @@ void setup() {
   // Check button connections
   checkButtonConnections();
   
+  // Initialize joystick button states after connection check
+  joystick_button_state = (digitalRead(JOYSTICK_BUTTON_PIN) == LOW);
+  last_joystick_button_state = joystick_button_state;
+  Serial.printf("🔍 Initial joystick button state: %s\n", joystick_button_state ? "PRESSED" : "released");
+  
   // Initialize I2C for OLED and MPU6050
   Wire.begin();
   
   // Initialize OLED display
+  Serial.println("Initializing OLED display...");
   if(!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
     Serial.println(F("SSD1306 allocation failed"));
     for(;;);
   }
+  Serial.println("OLED display initialized successfully");
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.display();
+  Serial.println("Display cleared and configured");
   
   // Initialize MPU6050 and check connection
   mpu.initialize();
@@ -250,6 +271,17 @@ void setup() {
   Serial.println("Controller initialized successfully");
   displayStatus("Controller Ready");
   
+  // Force display test
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("DISPLAY TEST");
+  display.setCursor(0, 20);
+  display.println("If you see this,");
+  display.setCursor(0, 30);
+  display.println("display is working!");
+  display.display();
+  delay(3000);
+  
   esp_now_initialized = true;
   last_successful_receive = millis();
 }
@@ -275,8 +307,8 @@ void checkConnectionHealth() {
     receiver_connected = false;
   }
   
-  // Try channel switching if connection is poor
-  if (consecutive_failures >= MAX_FAILURES && 
+  // Try channel switching if connection is poor and auto-reconnect is enabled
+  if (auto_reconnect_enabled && consecutive_failures >= MAX_FAILURES && 
       current_time - last_channel_switch > CHANNEL_SWITCH_COOLDOWN) {
     switchChannel();
   }
@@ -412,35 +444,141 @@ void checkButtonConnections() {
     }
   }
   
-  // Check joystick button
-  int first_read = digitalRead(JOYSTICK_BUTTON_PIN);
-  bool all_same = true;
+  // Check joystick button - Test if it's actually connected
+  Serial.println("🔍 Testing joystick button connection...");
+  int joystick_first_read = digitalRead(JOYSTICK_BUTTON_PIN);
+  Serial.printf("🔍 Initial joystick button reading: %d\n", joystick_first_read);
+  
+  bool joystick_all_same = true;
   
   for (int j = 1; j < samples; j++) {
-    if (digitalRead(JOYSTICK_BUTTON_PIN) != first_read) {
-      all_same = false;
+    int current_read = digitalRead(JOYSTICK_BUTTON_PIN);
+    Serial.printf("🔍 Sample %d: %d\n", j, current_read);
+    if (current_read != joystick_first_read) {
+      joystick_all_same = false;
+      Serial.printf("🔍 Variation detected at sample %d\n", j);
       break;
     }
     delay(1);
   }
   
-  joystick_button_connected = !all_same;
+  joystick_button_connected = !joystick_all_same;
+  Serial.printf("🔍 Joystick button connection test: %s (raw reading: %d, all_same: %s)\n", 
+               joystick_button_connected ? "CONNECTED" : "DISCONNECTED", 
+               joystick_first_read, 
+               joystick_all_same ? "YES" : "NO");
+  
+  // Force connection for testing if it's detected as disconnected
   if (!joystick_button_connected) {
-    Serial.println("Joystick button appears to be disconnected");
+    Serial.println("🔍 WARNING: Joystick button detected as disconnected, but forcing connection for testing");
+    joystick_button_connected = true;
   }
+  
+  // Initialize joystick button states to match current reading
+  joystick_button_state = (digitalRead(JOYSTICK_BUTTON_PIN) == LOW);
+  last_joystick_button_state = joystick_button_state;
+  Serial.printf("🔍 Initial joystick button state: %s\n", joystick_button_state ? "PRESSED" : "released");
 }
 
 void readButtons() {
-  // Read regular buttons (only if connected)
-  if (button_connected[0]) button_states[0] = !digitalRead(BUTTON_1_PIN);
-  if (button_connected[1]) button_states[1] = !digitalRead(BUTTON_2_PIN);
-  if (button_connected[2]) button_states[2] = !digitalRead(BUTTON_3_PIN);
-  if (button_connected[3]) button_states[3] = !digitalRead(BUTTON_4_PIN);
-  if (button_connected[4]) button_states[4] = !digitalRead(BUTTON_5_PIN);
+  unsigned long current_time = millis();
   
-  // Read joystick button (only if connected)
+  // Debug: Show that readButtons is being called
+  static unsigned long last_read_test = 0;
+  if (current_time - last_read_test > 5000) {
+    Serial.println("🔍 readButtons() function executing");
+    last_read_test = current_time;
+  }
+  
+  // Read regular buttons with enhanced debouncing (only if connected)
+  for (int i = 0; i < 5; i++) {
+    if (button_connected[i]) {
+      int pin = (i == 0) ? BUTTON_1_PIN : (i == 1) ? BUTTON_2_PIN : 
+                (i == 2) ? BUTTON_3_PIN : (i == 3) ? BUTTON_4_PIN : BUTTON_5_PIN;
+      
+      bool raw_button_pressed = !digitalRead(pin); // Button pressed when LOW (due to INPUT_PULLUP)
+      
+      // Track state changes for debouncing
+      if (raw_button_pressed != last_button_states[i]) {
+        button_debounce_times[i] = current_time;
+        button_stable_readings[i] = 0;
+      } else {
+        // Same reading - increment stable counter
+        button_stable_readings[i]++;
+      }
+      
+      // Enhanced debouncing with stability check
+      if ((current_time - button_debounce_times[i]) > BUTTON_DEBOUNCE_DELAY && 
+          button_stable_readings[i] >= REQUIRED_STABLE_READINGS) {
+        // If the button state has changed and readings are stable
+        if (raw_button_pressed != button_states[i]) {
+          button_states[i] = raw_button_pressed;
+          
+          // Debug: Show button state change
+          if (button_states[i]) {
+            Serial.printf("Button %d PRESSED (stable readings: %d)\n", i + 1, button_stable_readings[i]);
+          } else {
+            Serial.printf("Button %d released (stable readings: %d)\n", i + 1, button_stable_readings[i]);
+          }
+        }
+      }
+      
+      // Save the reading for next comparison
+      last_button_states[i] = raw_button_pressed;
+    }
+  }
+  
+  // Read joystick button with enhanced debouncing (only if connected)
   if (joystick_button_connected) {
-    joystick_button_state = !digitalRead(JOYSTICK_BUTTON_PIN);
+    // Simple raw reading test every 5 seconds
+    static unsigned long last_raw_test = 0;
+    if (current_time - last_raw_test > 5000) {
+      Serial.printf("🔘 Raw joystick button reading: %d\n", digitalRead(JOYSTICK_BUTTON_PIN));
+      last_raw_test = current_time;
+    }
+    bool raw_joystick_pressed = (digitalRead(JOYSTICK_BUTTON_PIN) == LOW); // Button pressed when LOW
+    
+    // Track state changes for debouncing
+    if (raw_joystick_pressed != last_joystick_button_state) {
+      joystick_button_debounce_time = current_time;
+      joystick_button_stable_readings = 0;
+      Serial.printf("🔘 Joystick button state change: %s -> %s\n", 
+                   last_joystick_button_state ? "HIGH" : "LOW",
+                   raw_joystick_pressed ? "HIGH" : "LOW");
+    } else {
+      // Same reading - increment stable counter
+      joystick_button_stable_readings++;
+    }
+    
+    // Enhanced debouncing with stability check
+    if ((current_time - joystick_button_debounce_time) > BUTTON_DEBOUNCE_DELAY && 
+        joystick_button_stable_readings >= REQUIRED_STABLE_READINGS) {
+      // If the button state has changed and readings are stable
+      if (raw_joystick_pressed != joystick_button_state) {
+        joystick_button_state = raw_joystick_pressed;
+        
+        // Debug: Show joystick button state change
+        if (joystick_button_state) {
+          Serial.printf("🔘 Joystick button PRESSED (stable readings: %d)\n", joystick_button_stable_readings);
+        } else {
+          Serial.printf("🔘 Joystick button released (stable readings: %d)\n", joystick_button_stable_readings);
+        }
+      }
+    }
+    
+    // Save the reading for next comparison
+    last_joystick_button_state = raw_joystick_pressed;
+    
+    // Debug: Show joystick button status every 2 seconds
+    static unsigned long last_joystick_debug = 0;
+    if (current_time - last_joystick_debug > 2000) {
+      Serial.printf("🔘 Joystick Debug - Raw: %d, Debounced: %s, Stable: %d, Time: %lu\n", 
+                   digitalRead(JOYSTICK_BUTTON_PIN),
+                   joystick_button_state ? "PRESSED" : "released",
+                   joystick_button_stable_readings,
+                   current_time - joystick_button_debounce_time);
+      last_joystick_debug = current_time;
+    }
   }
   
   // Pack button states into a byte (including joystick button as bit 5)
@@ -452,6 +590,15 @@ void readButtons() {
   }
   if (joystick_button_state) {
     controller_data.button_states |= (1 << 5); // Bit 5 for joystick button
+  }
+  
+  // Debug: Show button_states value when it changes
+  static uint8_t last_button_states_sent = 0;
+  if (controller_data.button_states != last_button_states_sent) {
+    Serial.printf("Button states sent: 0x%02X (joystick_bit5=%d)\n", 
+                 controller_data.button_states, 
+                 (controller_data.button_states & (1 << 5)) ? 1 : 0);
+    last_button_states_sent = controller_data.button_states;
   }
 }
 
@@ -487,8 +634,14 @@ void handleButtonPresses() {
             Serial.printf("Gesture control %s\n", gesture_control_enabled ? "enabled" : "disabled");
           }
           break;
-        case 2: // Button 3 - Emergency stop (if implemented)
-          Serial.println("Emergency stop button pressed");
+        case 2: // Button 3 - Toggle emergency stop mode
+          emergency_stop_enabled = !emergency_stop_enabled;
+          Serial.printf("Emergency stop mode %s\n", emergency_stop_enabled ? "ENABLED" : "disabled");
+          if (emergency_stop_enabled) {
+            displayStatus("Emergency Stop ON");
+          } else {
+            displayStatus("Emergency Stop OFF");
+          }
           break;
         case 3: // Button 4 - Toggle turbo mode
           if (current_mode == MODE_NORMAL) {
@@ -498,18 +651,30 @@ void handleButtonPresses() {
           }
           Serial.printf("Turbo mode %s\n", (current_mode == MODE_TURBO) ? "enabled" : "disabled");
           break;
-        case 4: // Button 5 - Reset connection
-          reconnectESPNow();
+        case 4: // Button 5 - Toggle auto-reconnect
+          auto_reconnect_enabled = !auto_reconnect_enabled;
+          Serial.printf("Auto-reconnect %s\n", auto_reconnect_enabled ? "enabled" : "disabled");
+          if (!auto_reconnect_enabled) {
+            displayStatus("Auto-reconnect OFF");
+          } else {
+            displayStatus("Auto-reconnect ON");
+          }
           break;
       }
     }
     last_button_states[i] = button_states[i];
   }
   
-  // Check joystick button
+  // Check joystick button - Toggle debug mode
   if (joystick_button_state && !last_joystick_button_state) {
-    Serial.println("Joystick button pressed");
-    // Add joystick button functionality here
+    Serial.printf("🎯 Joystick button PRESS detected - toggling debug mode\n");
+    debug_mode_enabled = !debug_mode_enabled;
+    Serial.printf("Debug mode %s\n", debug_mode_enabled ? "ENABLED" : "disabled");
+    if (debug_mode_enabled) {
+      displayStatus("Debug Mode ON");
+    } else {
+      displayStatus("Debug Mode OFF");
+    }
   }
   last_joystick_button_state = joystick_button_state;
 }
@@ -556,6 +721,14 @@ void loop() {
   
   // Read inputs
   readJoystick();
+  
+  // Debug: Test if readButtons is being called
+  static unsigned long last_button_test = 0;
+  if (current_time - last_button_test > 3000) {
+    Serial.println("🔍 readButtons() function called");
+    last_button_test = current_time;
+  }
+  
   readButtons();
   readMPU6050();
   handleButtonPresses();
@@ -768,6 +941,13 @@ void sendData() {
 }
 
 void updateDisplay() {
+  // Debug: Print display update every 5 seconds
+  static unsigned long last_display_debug = 0;
+  if (millis() - last_display_debug > 5000) {
+    Serial.println("Updating display...");
+    last_display_debug = millis();
+  }
+  
   display.clearDisplay();
   
   // Display title and connection status
@@ -822,11 +1002,14 @@ void updateDisplay() {
       break;
   }
   
-  // Display connection quality
+  // Show toggle states
   display.setCursor(0, 55);
-  display.print("Quality: ");
-  display.print(connection_quality);
-  display.print("%");
+  display.print("ES:");
+  display.print(emergency_stop_enabled ? "ON" : "OFF");
+  display.print(" D:");
+  display.print(debug_mode_enabled ? "ON" : "OFF");
+  display.print(" AR:");
+  display.print(auto_reconnect_enabled ? "ON" : "OFF");
   
   display.display();
 }

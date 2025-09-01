@@ -73,7 +73,10 @@ void loop() {
     // Process data
     usb_data.throttle = received_data.joystick_y;
     usb_data.steering = received_data.joystick_x;
-    usb_data.emergency_stop = 0;
+    
+    // Check if joystick button is pressed (bit 5 of button_states)
+    bool joystick_button_pressed = (received_data.button_states & (1 << 5)) != 0;
+    usb_data.emergency_stop = joystick_button_pressed ? 1 : 0;
     
     // Calculate checksum
     usb_data.checksum = 0;
@@ -88,7 +91,7 @@ void loop() {
     Serial.write(0xBB);
     Serial.flush();
     
-    Serial.printf("Sent to Pi: Throttle=%d, Steering=%d\n", usb_data.throttle, usb_data.steering);
+    Serial.printf("Sent to Pi: Throttle=%d, Steering=%d, Emergency=%d\n", usb_data.throttle, usb_data.steering, usb_data.emergency_stop);
     
     new_data_received = false;
   }
@@ -102,7 +105,8 @@ void OnDataRecv(const esp_now_recv_info *recv_info, const uint8_t *data, int dat
   if (data_len == sizeof(controller_data_t)) {
     memcpy(&received_data, data, sizeof(controller_data_t));
     new_data_received = true;
-    Serial.printf("Data processed: X=%d, Y=%d\n", received_data.joystick_x, received_data.joystick_y);
+    bool button_pressed = (received_data.button_states & (1 << 5)) != 0;
+    Serial.printf("Data processed: X=%d, Y=%d, Button=%s\n", received_data.joystick_x, received_data.joystick_y, button_pressed ? "PRESSED" : "released");
   } else {
     Serial.printf("Wrong data size: expected %d, got %d\n", sizeof(controller_data_t), data_len);
   }
