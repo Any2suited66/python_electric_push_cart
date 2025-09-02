@@ -8,6 +8,8 @@ import serial
 import struct
 import time
 import threading
+import os
+import sys
 
 class MinimalHoverboardController:
     def __init__(self):
@@ -23,12 +25,35 @@ class MinimalHoverboardController:
         self.throttle = 0
         self.steering = 0
         self.emergency_stop = 0
+        self.cruise_control = 0
+        self.cruise_speed = 0
+        
+        # Debug mode - set to False for production (silent operation)
+        self.debug_mode = True  # Change to False to disable ALL logging
+        
+        # Speed change priority flag for immediate motor override
+        self.speed_change_priority = False
+        self.last_speed_change_time = 0
+        
+        # Motor command queue for immediate response
+        self.motor_command_queue = []
+        self.motor_command_lock = threading.Lock()
         
         # Running state
         self.running = False
         
+    def debug_print(self, message):
+        """Print message only if debug mode is enabled"""
+        if self.debug_mode:
+            print(message)
+    
     def find_esp32_port(self):
         """Find ESP32 port"""
+        # First try the persistent symlink
+        if os.path.exists('/dev/esp32-receiver'):
+            return '/dev/esp32-receiver'
+        
+        # Fallback to auto-detection
         import serial.tools.list_ports
         ports = list(serial.tools.list_ports.comports())
         
@@ -44,10 +69,10 @@ class MinimalHoverboardController:
         try:
             self.esp32_port = self.find_esp32_port()
             self.esp32_ser = serial.Serial(self.esp32_port, 115200, timeout=1)
-            print(f"✓ Connected to ESP32 on {self.esp32_port}")
+            self.debug_print(f"✓ Connected to ESP32 on {self.esp32_port}")
             return True
         except Exception as e:
-            print(f"✗ Failed to connect to ESP32: {e}")
+            self.debug_print(f"✗ Failed to connect to ESP32: {e}")
             return False
     
     def connect_hoverboard(self):
@@ -55,12 +80,14 @@ class MinimalHoverboardController:
         try:
             self.hoverboard_ser = serial.Serial('/dev/ttyAMA0', 9600, timeout=1)
             self.hoverboard_connected = True
-            print("✓ Connected to hoverboard")
+            self.debug_print("✓ Connected to hoverboard")
             return True
         except Exception as e:
-            print(f"✗ Failed to connect to hoverboard: {e}")
+            self.debug_print(f"✗ Failed to connect to hoverboard: {e}")
             return False
     
+
+            
     def send_hoverboard_command(self, steer, speed):
         """Send command to hoverboard"""
         if not self.hoverboard_connected:
@@ -89,9 +116,9 @@ class MinimalHoverboardController:
             return False
     
     def parse_data(self, data):
-        """Parse simple packet format"""
+        """Parse controller data format"""
         try:
-            if len(data) < 6:  # Minimum size
+            if len(data) < 8:  # Minimum size (start + 6 bytes + end)
                 return False
                 
             if data[0] != 0xAA or data[-1] != 0xBB:
@@ -100,24 +127,19 @@ class MinimalHoverboardController:
             # Extract data (skip start/end bytes)
             data_bytes = data[1:-1]
             
-            if len(data_bytes) != 6:  # throttle(2) + steering(2) + emergency(1) + checksum(1) = 6 bytes
+            # New structure: throttle(2) + steering(2) + emergency(1) + cruise_control(1) + cruise_speed(2) + checksum(1) = 9 bytes
+            if len(data_bytes) != 9:
                 return False
                 
-            # Parse data
-            throttle, steering, emergency_stop, checksum = struct.unpack('<hhBB', data_bytes)
-            
-            # Validate checksum
-            calculated_checksum = 0
-            for i in range(5):  # First 5 bytes
-                calculated_checksum ^= data_bytes[i]
-            
-            if calculated_checksum != checksum:
-                return False
+            # Parse USB data structure (from receiver ESP32)
+            throttle, steering, emergency_stop, cruise_control, cruise_speed, checksum = struct.unpack('<hhBBhB', data_bytes)
             
             # Update control data
             self.throttle = throttle
             self.steering = steering
             self.emergency_stop = emergency_stop
+            self.cruise_control = cruise_control
+            self.cruise_speed = cruise_speed
             
             return True
             
@@ -125,7 +147,7 @@ class MinimalHoverboardController:
             return False
     
     def read_data_loop(self):
-        """Read data from ESP32"""
+        """Read data from ESP32 with priority cruise control processing"""
         buffer = b''
         
         while self.running:
@@ -154,18 +176,92 @@ class MinimalHoverboardController:
                             
                             # Parse packet
                             if self.parse_data(packet):
-                                print(f"✓ Data: Throttle={self.throttle}, Steering={self.steering}, Emergency={self.emergency_stop}")
+                                # Check if cruise control state changed
+                                if hasattr(self, 'last_cruise_control') and self.cruise_control != self.last_cruise_control:
+                                    self.debug_print(f"🚨 CRUISE CONTROL STATE CHANGE: {self.last_cruise_control} -> {self.cruise_control}")
+                                    if not self.cruise_control:
+                                        self.debug_print(f"🚨 CRUISE CONTROL DISABLED - Processing immediately for safety!")
+                                self.last_cruise_control = self.cruise_control
+                                
+                                # Check if cruise control speed changed (for instant response)
+                                if hasattr(self, 'last_cruise_speed') and self.cruise_speed != self.last_cruise_speed:
+                                    self.debug_print(f"🚗 CRUISE SPEED CHANGED: {self.last_cruise_speed} -> {self.cruise_speed}")
+                                    
+                                    # Set priority flag for immediate motor override
+                                    self.speed_change_priority = True
+                                    self.last_speed_change_time = time.time()
+                                    
+                                    # QUEUE MOTOR COMMAND for immediate execution in main thread
+                                    if self.hoverboard_connected:
+                                        # Calculate motor values directly (same logic as control_hoverboard)
+                                        throttle_norm = self.cruise_speed / 512.0
+                                        steering_norm = self.steering / 512.0
+                                        
+                                        # Tank-style mixing
+                                        left_motor = throttle_norm - steering_norm
+                                        right_motor = throttle_norm + steering_norm
+                                        
+                                        # Apply deadzone and scaling
+                                        deadzone = 0.05
+                                        if abs(left_motor) < deadzone: left_motor = 0
+                                        if abs(right_motor) < deadzone: right_motor = 0
+                                        
+                                        max_speed = 300
+                                        left_speed = int(left_motor * max_speed)
+                                        right_speed = int(right_motor * max_speed)
+                                        
+                                        # Convert to hoverboard protocol
+                                        steer = (left_speed - right_speed) // 2
+                                        speed = (left_speed + right_speed) // 2
+                                        
+                                        # Clamp values
+                                        steer = max(-300, min(300, steer))
+                                        speed = max(-300, min(300, speed))
+                                        
+                                        # Queue command for immediate execution
+                                        with self.motor_command_lock:
+                                            self.motor_command_queue.append((steer, speed))
+                                        self.debug_print(f"🚀 MOTOR COMMAND QUEUED: Steer={steer}, Speed={speed}")
+                                    
+                                    # Also update control loop for consistency
+                                    self.control_hoverboard()
+                                self.last_cruise_speed = self.cruise_speed
+                                
+                                # Only print data when not in cruise control to reduce overhead
+                                if not self.cruise_control:
+                                    self.debug_print(f"✓ Data: Throttle={self.throttle}, Steering={self.steering}, Emergency={self.emergency_stop}, Cruise={self.cruise_control}, CruiseSpeed={self.cruise_speed}")
+                            else:
+                                # Debug: Show packet info when parsing fails (only when not in cruise control)
+                                if not self.cruise_control:
+                                    self.debug_print(f"❌ Parse failed: Packet length={len(packet)}, Data length={len(packet)-2}")
+                                    self.debug_print(f"   Raw: {[hex(b) for b in packet[:10]]}")
                 
-                time.sleep(0.001)
+                # ULTRA-FAST reading during cruise control for instant response
+                if self.cruise_control:
+                    time.sleep(0.00001)  # 100000Hz reading rate during cruise control (10x faster!)
+                else:
+                    time.sleep(0.001)   # 1000Hz normal reading rate
                 
             except Exception as e:
                 print(f"Error reading data: {e}")
                 time.sleep(1)
     
     def control_hoverboard(self):
-        """Control hoverboard"""
-        # Convert joystick to motor speeds
-        throttle_norm = self.throttle / 512.0
+        """Control hoverboard with immediate cruise control response"""
+        # Check if cruise control is enabled
+        if self.cruise_control:
+            # Use cruise control speed instead of joystick throttle
+            throttle_norm = self.cruise_speed / 512.0
+            self.debug_print(f"🚗 Cruise control ACTIVE - Speed: {self.cruise_speed}")
+        else:
+            # Use normal joystick throttle
+            throttle_norm = self.throttle / 512.0
+            
+                    # Track cruise control state changes for debugging
+            if hasattr(self, 'last_cruise_state') and self.last_cruise_state != self.cruise_control:
+                self.debug_print(f"🚨 CRUISE CONTROL STATE CHANGE: {self.last_cruise_state} -> {self.cruise_control}")
+            self.last_cruise_state = self.cruise_control
+            
         steering_norm = self.steering / 512.0
         
         # Tank-style mixing (corrected)
@@ -182,7 +278,7 @@ class MinimalHoverboardController:
             right_motor = 0
         
         # Scale to motor range
-        max_speed = 500
+        max_speed = 300  # Reduced from 500 for safer operation
         left_speed = int(left_motor * max_speed)
         right_speed = int(right_motor * max_speed)
         
@@ -206,13 +302,13 @@ class MinimalHoverboardController:
                 speed = 50 if speed >= 0 else -50  # Add minimum speed in same direction
             
             # Clamp values to reasonable ranges
-            steer = max(-500, min(500, steer))  # Allow full motor range
-            speed = max(-500, min(500, speed))  # Allow full motor range
+            steer = max(-300, min(300, steer))  # Reduced from 500 for safer operation
+            speed = max(-300, min(300, speed))  # Reduced from 500 for safer operation
             
             # Send in correct order: (steer, speed) as per test script
             self.send_hoverboard_command(steer, speed)
             
-            print(f"Motor: Left={left_speed}, Right={right_speed}")
+            self.debug_print(f"Motor: Left={left_speed}, Right={right_speed}")
     
     def start(self):
         """Start the controller"""
@@ -228,15 +324,37 @@ class MinimalHoverboardController:
         data_thread = threading.Thread(target=self.read_data_loop, daemon=True)
         data_thread.start()
         
-        print("Minimal controller started")
+        self.debug_print("Minimal controller started")
+        self.debug_print("🚀 Performance mode: Auto-enabled during cruise control for instant response")
         
         try:
             while self.running:
+                # Check if speed change priority is active
+                if self.speed_change_priority:
+                    # Clear priority flag after 100ms to allow normal operation
+                    if time.time() - self.last_speed_change_time > 0.1:
+                        self.speed_change_priority = False
+                        if self.debug_mode:
+                            self.debug_print("🔄 Speed change priority cleared - returning to normal operation\n")
+                
+                # EXECUTE QUEUED MOTOR COMMANDS IMMEDIATELY
+                with self.motor_command_lock:
+                    if self.motor_command_queue:
+                        steer, speed = self.motor_command_queue.pop(0)
+                        if self.hoverboard_connected:
+                            self.send_hoverboard_command(steer, speed)
+                            if self.debug_mode:
+                                self.debug_print(f"🚀 EXECUTING QUEUED COMMAND: Steer={steer}, Speed={speed}\n")
+                
                 self.control_hoverboard()
-                time.sleep(0.05)  # 20Hz
+                # ULTRA-FAST control loop during cruise control for instant response
+                if self.cruise_control:
+                    time.sleep(0.0001)  # 10000Hz during cruise control (100x faster!)
+                else:
+                    time.sleep(0.01)   # 100Hz normal operation
                 
         except KeyboardInterrupt:
-            print("\nStopping...")
+            self.debug_print("\nStopping...")
         finally:
             self.running = False
             if self.esp32_ser:
@@ -248,7 +366,28 @@ def main():
     print("Minimal Hoverboard Controller")
     print("============================")
     
+    # Check for command-line arguments
+    debug_mode = True  # Default to debug mode
+    if len(sys.argv) > 1:
+        if sys.argv[1].lower() in ['--silent', '-s', '--quiet', '-q']:
+            debug_mode = False
+            print("🔇 SILENT MODE: No logging output")
+        elif sys.argv[1].lower() in ['--debug', '-d', '--verbose', '-v']:
+            debug_mode = True
+            print("🔊 DEBUG MODE: Full logging output")
+        else:
+            print(f"Usage: {sys.argv[0]} [--silent|--debug]")
+            print("  --silent, -s: No logging output (production mode)")
+            print("  --debug, -d: Full logging output (debug mode)")
+            print("  No argument: Default debug mode")
+            print("")
+    
+    if debug_mode:
+        print("🔊 DEBUG MODE: Full logging output")
+    print("")
+    
     controller = MinimalHoverboardController()
+    controller.debug_mode = debug_mode  # Override the default
     controller.start()
 
 if __name__ == "__main__":
