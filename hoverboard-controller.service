@@ -1,0 +1,28 @@
+[Unit]
+Description=Hoverboard Controller Service
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+# Set User/Group to your Pi login, then install with:
+#   sudo cp hoverboard-controller.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now hoverboard-controller
+User=YOUR_USER
+Group=YOUR_USER
+WorkingDirectory=%h/python_electric_push_cart
+ExecStart=/usr/bin/python3 %h/python_electric_push_cart/hoverboard_minimal.py --silent
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Environment variables
+Environment=PYTHONUNBUFFERED=1
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

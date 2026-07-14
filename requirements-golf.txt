@@ -1,0 +1,3 @@
+# Golf green yardages POC (golf_green_yardages.py)
+shapely>=2.0
+requests>=2.28

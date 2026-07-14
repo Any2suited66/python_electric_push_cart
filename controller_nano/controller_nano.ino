@@ -1,26 +1,20 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <Wire.h>
+#include <MPU6050.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_GFX.h>
-#include <MPU6050.h>
 
-// OLED Display Configuration
+// OLED Display Configuration - 0.91 inch 128x32
 #define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
+#define SCREEN_HEIGHT 32
 #define OLED_RESET -1
 #define SCREEN_ADDRESS 0x3C
 
-// Pin Definitions
-#define JOYSTICK_X_PIN 32  // PS4 joystick X-axis
-#define JOYSTICK_Y_PIN 33  // PS4 joystick Y-axis
-#define JOYSTICK_BUTTON_PIN 4  // PS4 joystick button press
-#define BUTTON_1_PIN 25    // Button 1
-#define BUTTON_2_PIN 26    // Button 2
-#define BUTTON_3_PIN 27    // Button 3
-#define BUTTON_4_PIN 14    // Button 4
-#define BUTTON_5_PIN 12    // Button 5
-#define LBO_PIN 13         // PowerBoost 1000C Low Battery Output pin
+// Pin Definitions - ESP32-S3 Nano compatible (D2-D13)
+#define JOYSTICK_X_PIN 2   // PS4 joystick X-axis (D2)
+#define JOYSTICK_Y_PIN 3   // PS4 joystick Y-axis (D3)
+#define CRUISE_BUTTON_PIN 4  // Cruise control button (D4)
 
 // ESP-NOW Configuration - Broadcast for automatic discovery
 #define BROADCAST_MAC_ADDRESS {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF} // Broadcast to all devices
@@ -108,23 +102,18 @@ uint8_t current_channel_index = 0;
 unsigned long last_channel_switch = 0;
 const unsigned long CHANNEL_SWITCH_COOLDOWN = 30000; // 30 seconds between channel switches
 
-// Button states with enhanced debouncing
-bool button_states[5] = {false, false, false, false, false};
-bool last_button_states[5] = {false, false, false, false, false};
-bool joystick_button_state = false;
+// Cruise control button state
+bool cruise_button_state = false;
+bool last_cruise_button_state = false;
 
-
-// Enhanced button debouncing variables
-unsigned long button_debounce_times[5] = {0, 0, 0, 0, 0};
-unsigned long joystick_button_debounce_time = 0;
+// Button debouncing variables
+unsigned long cruise_button_debounce_time = 0;
 const unsigned long BUTTON_DEBOUNCE_DELAY = 50; // 50ms debounce
-int button_stable_readings[5] = {0, 0, 0, 0, 0};
-int joystick_button_stable_readings = 0;
+int cruise_button_stable_readings = 0;
 const int REQUIRED_STABLE_READINGS = 5; // Need 5 stable readings to confirm state
 
 // Button connection status
-bool button_connected[5] = {true, true, true, true, true};
-bool joystick_button_connected = true;
+bool cruise_button_connected = true;
 
 // Operation modes
 enum OperationMode {
@@ -154,23 +143,12 @@ bool mpu_connected = false;
 unsigned long mpu_init_start_time = 0;
 const unsigned long MPU_INIT_DURATION = 3000; // 3 seconds for calibration
 
-// Battery monitoring with PowerBoost 1000C
+// Battery simulation (replace with actual battery monitoring)
 uint8_t controller_battery = 85;
-bool low_battery_warning = false;
-bool last_lbo_state = false;
-unsigned long last_battery_check = 0;
-const unsigned long BATTERY_CHECK_INTERVAL = 1000; // Check every 1 second
-unsigned long low_battery_blink_time = 0;
-const unsigned long LOW_BATTERY_BLINK_INTERVAL = 500; // Blink every 500ms
-bool low_battery_display_on = false;
-bool low_battery_warning_shown = false;
-// cart_battery variable removed since cart_battery_level field was removed from struct
 
 // Function declarations
 void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t sendStatus);
 void OnDataRecv(const esp_now_recv_info *recv_info, const uint8_t *data, int data_len);
-void displayStatus(const char* message);
-void updateDisplay();
 bool hasSignificantChange();
 void sendData();
 void processTransmissionQueue();
@@ -178,8 +156,8 @@ void sendAcknowledgment();
 void runJoystickHardwareTest();
 void debugPrint(const char* message);
 void debugPrintf(const char* format, ...);
-void checkBatteryStatus();
-void displayLowBatteryWarning();
+void updateDisplay();
+void displayStatus(const char* message);
 
 void setup() {
   Serial.begin(115200);
@@ -187,7 +165,7 @@ void setup() {
   // Initialize pins
   pinMode(JOYSTICK_X_PIN, INPUT);
   pinMode(JOYSTICK_Y_PIN, INPUT);
-  pinMode(JOYSTICK_BUTTON_PIN, INPUT_PULLUP);
+  pinMode(CRUISE_BUTTON_PIN, INPUT_PULLUP);
   
   // Configure ADC for better joystick readings
   analogReadResolution(12);  // Set ADC resolution to 12 bits (0-4095)
@@ -205,21 +183,12 @@ void setup() {
     delay(100);
   }
   
-  pinMode(BUTTON_1_PIN, INPUT_PULLUP);
-  pinMode(BUTTON_2_PIN, INPUT_PULLUP);
-  pinMode(BUTTON_3_PIN, INPUT_PULLUP);
-  pinMode(BUTTON_4_PIN, INPUT_PULLUP);
-  pinMode(BUTTON_5_PIN, INPUT_PULLUP);
+  // Check cruise button connection
+  checkCruiseButtonConnection();
   
-  // Initialize PowerBoost 1000C LBO pin
-  pinMode(LBO_PIN, INPUT_PULLUP);
-  
-  // Check button connections
-  checkButtonConnections();
-  
-  // Initialize joystick button state after connection check
-  joystick_button_state = (digitalRead(JOYSTICK_BUTTON_PIN) == LOW);
-  Serial.printf("🔍 Initial joystick button state: %s\n", joystick_button_state ? "PRESSED" : "released");
+  // Initialize cruise button state after connection check
+  cruise_button_state = (digitalRead(CRUISE_BUTTON_PIN) == LOW);
+  Serial.printf("🔍 Initial cruise button state: %s\n", cruise_button_state ? "PRESSED" : "released");
   
   // Initialize I2C for OLED and MPU6050
   Wire.begin();
@@ -273,7 +242,7 @@ void setup() {
   esp_now_register_send_cb(OnDataSent);
   esp_now_register_recv_cb(OnDataRecv);
   
-  // Add broadcast peer for ESP-NOW
+  // Add broadcast peer
   memcpy(broadcast_peer.peer_addr, broadcast_mac, 6);
   broadcast_peer.channel = current_channel;
   broadcast_peer.encrypt = false;
@@ -281,21 +250,30 @@ void setup() {
   // Remove any existing peer first
   esp_now_del_peer(broadcast_mac);
   
-  esp_err_t peer_result = esp_now_add_peer(&broadcast_peer);
-  if (peer_result != ESP_OK) {
-    Serial.printf("❌ Failed to add broadcast peer: %d\n", peer_result);
+  if (esp_now_add_peer(&broadcast_peer) != ESP_OK) {
+    Serial.println("Warning: Failed to add broadcast peer");
     Serial.println("Will try to send data anyway...");
   } else {
-    Serial.println("✅ Broadcast peer added successfully");
+    Serial.println("Broadcast peer added successfully");
   }
   
   Serial.println("ESP-NOW initialized successfully");
   Serial.printf("Broadcasting to all devices on channel %d\n", current_channel);
   
-  Serial.println("Controller initialized successfully");
+  Serial.println("Controller Nano initialized successfully");
   Serial.printf("📏 Controller data structure size: %d bytes\n", sizeof(controller_data_t));
   displayStatus("Controller Ready");
   
+  // Force display test
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("DISPLAY TEST");
+  display.setCursor(0, 12);
+  display.println("If you see this,");
+  display.setCursor(0, 24);
+  display.println("display is working!");
+  display.display();
+  delay(3000);
   
   esp_now_initialized = true;
   last_successful_receive = millis();
@@ -372,7 +350,7 @@ void reconnectESPNow() {
   
   // Reset connection state
   waiting_for_ack = false;
-  displayStatus("Reconnected");
+  Serial.println("Reconnected");
 }
 
 void readJoystick() {
@@ -427,163 +405,101 @@ void readJoystick() {
   controller_data.joystick_x = map(x_raw, 0, 4095, -512, 512);
   controller_data.joystick_y = map(y_raw, 0, 4095, -512, 512);
   
-  // Apply deadzone and minimum threshold for hoverboard motors
-  if (abs(controller_data.joystick_x) < 50) {
-    controller_data.joystick_x = 0;
-  } else {
-    // Apply minimum threshold of 100 when joystick is moved beyond deadzone
-    if (controller_data.joystick_x > 0) {
-      controller_data.joystick_x = max(100, controller_data.joystick_x);
-    } else {
-      controller_data.joystick_x = min(-100, controller_data.joystick_x);
-    }
-  }
-  
-  if (abs(controller_data.joystick_y) < 50) {
-    controller_data.joystick_y = 0;
-  } else {
-    // Apply minimum threshold of 100 when joystick is moved beyond deadzone
-    if (controller_data.joystick_y > 0) {
-      controller_data.joystick_y = max(100, controller_data.joystick_y);
-    } else {
-      controller_data.joystick_y = min(-100, controller_data.joystick_y);
-    }
-  }
+  // Apply deadzone
+  if (abs(controller_data.joystick_x) < 50) controller_data.joystick_x = 0;
+  if (abs(controller_data.joystick_y) < 50) controller_data.joystick_y = 0;
 }
 
-void checkButtonConnections() {
-  // Check if buttons are connected by reading them multiple times
-  // If a button always reads the same value, it's likely disconnected
+void checkCruiseButtonConnection() {
+  // Check if cruise button is connected by reading it multiple times
+  // If button always reads the same value, it's likely disconnected
   const int samples = 10;
   
-  // Check regular buttons
-  for (int i = 0; i < 5; i++) {
-    int pin = (i == 0) ? BUTTON_1_PIN : (i == 1) ? BUTTON_2_PIN : 
-              (i == 2) ? BUTTON_3_PIN : (i == 3) ? BUTTON_4_PIN : BUTTON_5_PIN;
-    
-    int first_read = digitalRead(pin);
-    bool all_same = true;
-    
-    for (int j = 1; j < samples; j++) {
-      if (digitalRead(pin) != first_read) {
-        all_same = false;
-        break;
-      }
-      delay(1);
-    }
-    
-    button_connected[i] = !all_same;
-    if (!button_connected[i]) {
-      Serial.printf("Button %d appears to be disconnected\n", i + 1);
-    }
-  }
+  Serial.println("🔍 Testing cruise button connection...");
+  int cruise_first_read = digitalRead(CRUISE_BUTTON_PIN);
+  Serial.printf("🔍 Initial cruise button reading: %d\n", cruise_first_read);
   
-  // Check joystick button - Test if it's actually connected
-  Serial.println("🔍 Testing joystick button connection...");
-  int joystick_first_read = digitalRead(JOYSTICK_BUTTON_PIN);
-  Serial.printf("🔍 Initial joystick button reading: %d\n", joystick_first_read);
-  
-  bool joystick_all_same = true;
+  bool cruise_all_same = true;
   
   for (int j = 1; j < samples; j++) {
-    int current_read = digitalRead(JOYSTICK_BUTTON_PIN);
+    int current_read = digitalRead(CRUISE_BUTTON_PIN);
     Serial.printf("🔍 Sample %d: %d\n", j, current_read);
-    if (current_read != joystick_first_read) {
-      joystick_all_same = false;
+    if (current_read != cruise_first_read) {
+      cruise_all_same = false;
       Serial.printf("🔍 Variation detected at sample %d\n", j);
       break;
     }
     delay(1);
   }
   
-  joystick_button_connected = !joystick_all_same;
-  Serial.printf("🔍 Joystick button connection test: %s (raw reading: %d, all_same: %s)\n", 
-               joystick_button_connected ? "CONNECTED" : "DISCONNECTED", 
-               joystick_first_read, 
-               joystick_all_same ? "YES" : "NO");
+  cruise_button_connected = !cruise_all_same;
+  Serial.printf("🔍 Cruise button connection test: %s (raw reading: %d, all_same: %s)\n", 
+               cruise_button_connected ? "CONNECTED" : "DISCONNECTED", 
+               cruise_first_read, 
+               cruise_all_same ? "YES" : "NO");
   
   // Force connection for testing if it's detected as disconnected
-  if (!joystick_button_connected) {
-    Serial.println("🔍 WARNING: Joystick button detected as disconnected, but forcing connection for testing");
-    joystick_button_connected = true;
+  if (!cruise_button_connected) {
+    Serial.println("🔍 WARNING: Cruise button detected as disconnected, but forcing connection for testing");
+    cruise_button_connected = true;
   }
-  
-  // Initialize joystick button state to match current reading
-  joystick_button_state = (digitalRead(JOYSTICK_BUTTON_PIN) == LOW);
-  Serial.printf("🔍 Initial joystick button state: %s\n", joystick_button_state ? "PRESSED" : "released");
 }
 
-void readButtons() {
+void readCruiseButton() {
   unsigned long current_time = millis();
   
-  // Debug: Show that readButtons is being called
+  // Debug: Show that readCruiseButton is being called
   static unsigned long last_read_test = 0;
   if (current_time - last_read_test > 5000) {
-    Serial.println("🔍 readButtons() function executing");
+    Serial.println("🔍 readCruiseButton() function executing");
     last_read_test = current_time;
   }
   
-  // Read regular buttons with enhanced debouncing (only if connected)
-  for (int i = 0; i < 5; i++) {
-    if (button_connected[i]) {
-      int pin = (i == 0) ? BUTTON_1_PIN : (i == 1) ? BUTTON_2_PIN : 
-                (i == 2) ? BUTTON_3_PIN : (i == 3) ? BUTTON_4_PIN : BUTTON_5_PIN;
-      
-      bool raw_button_pressed = !digitalRead(pin); // Button pressed when LOW (due to INPUT_PULLUP)
-      
-      // Track state changes for debouncing
-      if (raw_button_pressed != last_button_states[i]) {
-        button_debounce_times[i] = current_time;
-        button_stable_readings[i] = 0;
-      } else {
-        // Same reading - increment stable counter
-        button_stable_readings[i]++;
-      }
-      
-      // Enhanced debouncing with stability check
-      if ((current_time - button_debounce_times[i]) > BUTTON_DEBOUNCE_DELAY && 
-          button_stable_readings[i] >= REQUIRED_STABLE_READINGS) {
-        // If the button state has changed and readings are stable
-        if (raw_button_pressed != button_states[i]) {
-          button_states[i] = raw_button_pressed;
-          
-          // Debug: Show button state change
-          if (button_states[i]) {
-            Serial.printf("Button %d PRESSED (stable readings: %d)\n", i + 1, button_stable_readings[i]);
-          } else {
-            Serial.printf("Button %d released (stable readings: %d)\n", i + 1, button_stable_readings[i]);
-          }
+  // Read cruise button with enhanced debouncing (only if connected)
+  if (cruise_button_connected) {
+    bool raw_button_pressed = !digitalRead(CRUISE_BUTTON_PIN); // Button pressed when LOW (due to INPUT_PULLUP)
+    
+    // Track state changes for debouncing
+    if (raw_button_pressed != last_cruise_button_state) {
+      cruise_button_debounce_time = current_time;
+      cruise_button_stable_readings = 0;
+    } else {
+      // Same reading - increment stable counter
+      cruise_button_stable_readings++;
+    }
+    
+    // Enhanced debouncing with stability check
+    if ((current_time - cruise_button_debounce_time) > BUTTON_DEBOUNCE_DELAY && 
+        cruise_button_stable_readings >= REQUIRED_STABLE_READINGS) {
+      // If the button state has changed and readings are stable
+      if (raw_button_pressed != cruise_button_state) {
+        cruise_button_state = raw_button_pressed;
+        
+        // Debug: Show button state change
+        if (cruise_button_state) {
+          Serial.printf("Cruise button PRESSED (stable readings: %d)\n", cruise_button_stable_readings);
+        } else {
+          Serial.printf("Cruise button released (stable readings: %d)\n", cruise_button_stable_readings);
         }
       }
-      
-      // Save the reading for next comparison
-      last_button_states[i] = raw_button_pressed;
     }
+    
+    // Save the reading for next comparison
+    last_cruise_button_state = raw_button_pressed;
   }
   
-  // Simple joystick button reading - no complex debouncing needed
-  if (joystick_button_connected) {
-    // Just read the button state for the button_states byte
-    joystick_button_state = (digitalRead(JOYSTICK_BUTTON_PIN) == LOW);
-  }
-  
-  // Pack button states into a byte (including joystick button as bit 5)
+  // Pack button state into a byte (cruise button as bit 0)
   controller_data.button_states = 0;
-  for (int i = 0; i < 5; i++) {
-    if (button_states[i]) {
-      controller_data.button_states |= (1 << i);
-    }
-  }
-  if (joystick_button_state) {
-    controller_data.button_states |= (1 << 5); // Bit 5 for joystick button
+  if (cruise_button_state) {
+    controller_data.button_states |= (1 << 0); // Bit 0 for cruise button
   }
   
   // Debug: Show button_states value when it changes
   static uint8_t last_button_states_sent = 0;
   if (controller_data.button_states != last_button_states_sent) {
-    debugPrintf("🔘 Button states sent: 0x%02X (joystick_bit5=%d, cruise_control=%s, cruise_speed=%d, struct_size=%d)\n", 
+    debugPrintf("🔘 Button states sent: 0x%02X (cruise_button_bit0=%d, cruise_control=%s, cruise_speed=%d, struct_size=%d)\n", 
                  controller_data.button_states, 
-                 (controller_data.button_states & (1 << 5)) ? 1 : 0,
+                 (controller_data.button_states & (1 << 0)) ? 1 : 0,
                  controller_data.cruise_speed,
                  sizeof(controller_data_t));
     last_button_states_sent = controller_data.button_states;
@@ -595,121 +511,10 @@ void readMPU6050() {
   // This function is kept for compatibility but does nothing
 }
 
-void handleButtonPresses() {
-  // Check for button press events (rising edge detection)
-  for (int i = 0; i < 5; i++) {
-    if (button_states[i] && !last_button_states[i]) {
-      // Button pressed
-      Serial.printf("Button %d pressed\n", i + 1);
-      
-      // Handle button actions
-      switch (i) {
-        case 0: // Button 1 - Toggle operation mode (except in follow mode)
-          if (current_mode != MODE_FOLLOW_ME) {
-            current_mode = (OperationMode)((current_mode + 1) % 4);
-            Serial.printf("Operation mode changed to %d\n", current_mode);
-          } else {
-            Serial.println("Button 1 in follow mode - tap gestures handled by cart");
-          }
-          break;
-        case 1: // Button 2 - Toggle gesture control
-          if (mpu_connected) {
-            gesture_control_enabled = !gesture_control_enabled;
-            if (gesture_control_enabled) {
-              mpu_init_start_time = millis();
-              mpu_initialized = false;
-              displayStatus("Gesture Control Starting...");
-            } else {
-              mpu_initialized = false;
-              displayStatus("Gesture Control Disabled");
-            }
-            Serial.printf("Gesture control %s\n", gesture_control_enabled ? "enabled" : "disabled");
-          }
-          break;
-        case 2: // Button 3 - Toggle emergency stop mode
-          emergency_stop_enabled = !emergency_stop_enabled;
-          Serial.printf("Emergency stop mode %s\n", emergency_stop_enabled ? "ENABLED" : "disabled");
-          if (emergency_stop_enabled) {
-            displayStatus("Emergency Stop ON");
-          } else {
-            displayStatus("Emergency Stop OFF");
-          }
-          break;
-        case 3: // Button 4 - Toggle turbo mode
-          if (current_mode == MODE_NORMAL) {
-            current_mode = MODE_TURBO;
-          } else if (current_mode == MODE_TURBO) {
-            current_mode = MODE_NORMAL;
-          }
-          Serial.printf("Turbo mode %s\n", (current_mode == MODE_TURBO) ? "enabled" : "disabled");
-          break;
-        case 4: // Button 5 - Toggle auto-reconnect
-          auto_reconnect_enabled = !auto_reconnect_enabled;
-          debugPrintf("Auto-reconnect %s\n", auto_reconnect_enabled ? "enabled" : "disabled");
-          if (!auto_reconnect_enabled) {
-            displayStatus("Auto-reconnect OFF");
-          } else {
-            displayStatus("Auto-reconnect ON");
-          }
-          break;
-      }
-    }
-    last_button_states[i] = button_states[i];
-  }
-
-  // In follow mode: triple-tap Button 1 exits to parking (single/double handled by Pi)
-  if (current_mode == MODE_FOLLOW_ME) {
-    static bool follow_btn1_prev = false;
-    static unsigned long follow_btn1_first_release = 0;
-    static uint8_t follow_btn1_taps = 0;
-    const unsigned long FOLLOW_BTN1_WINDOW_MS = 500;
-
-    bool follow_btn1_down = button_states[0];
-    if (!follow_btn1_down && follow_btn1_prev) {
-      unsigned long now = millis();
-      if (follow_btn1_taps == 0) {
-        follow_btn1_first_release = now;
-        follow_btn1_taps = 1;
-      } else if (now - follow_btn1_first_release <= FOLLOW_BTN1_WINDOW_MS) {
-        follow_btn1_taps++;
-        if (follow_btn1_taps >= 3) {
-          current_mode = MODE_PARKING;
-          follow_btn1_taps = 0;
-          displayStatus("Parking");
-          Serial.println("Triple tap Button 1 - exiting follow to parking");
-        }
-      } else {
-        follow_btn1_first_release = now;
-        follow_btn1_taps = 1;
-      }
-    }
-    if (follow_btn1_taps > 0 && millis() - follow_btn1_first_release > FOLLOW_BTN1_WINDOW_MS) {
-      follow_btn1_taps = 0;
-    }
-    follow_btn1_prev = follow_btn1_down;
-  }
-  
-  // DEBUG MODE TOGGLE - Button 1 + Button 2 held together for 2 seconds
-  static unsigned long debug_toggle_start = 0;
-  static bool debug_toggle_triggered = false;
-  
-  if (button_states[0] && button_states[1] && !debug_toggle_triggered) {
-    if (debug_toggle_start == 0) {
-      debug_toggle_start = millis();
-    } else if (millis() - debug_toggle_start > 2000) { // 2 seconds
-      debug_mode_enabled = !debug_mode_enabled;
-      debug_toggle_triggered = true;
-      displayStatus(debug_mode_enabled ? "Debug ON" : "Debug OFF");
-      delay(1000); // Show status for 1 second
-    }
-  } else if (!button_states[0] || !button_states[1]) {
-    debug_toggle_start = 0;
-    debug_toggle_triggered = false;
-  }
-  
+void handleCruiseButtonPress() {
   // FAST cruise control toggle - immediate response for safety!
   static bool button_was_pressed = false;
-  bool button_is_pressed = (digitalRead(JOYSTICK_BUTTON_PIN) == LOW);
+  bool button_is_pressed = (digitalRead(CRUISE_BUTTON_PIN) == LOW);
   
   // Detect button press (transition from not pressed to pressed)
   if (button_is_pressed && !button_was_pressed) {
@@ -721,7 +526,7 @@ void handleButtonPresses() {
       cruise_control_changed = true; // Force immediate transmission
       performance_mode = true; // Enable performance mode for instant response
       debugPrintf("🚗 Cruise control ON at speed: %d\n", current_cruise_speed);
-      // Update display asynchronously to avoid delay
+      Serial.println("Cruise Control ON");
       displayStatus("Cruise Control ON");
     } else {
       // Deactivate cruise control IMMEDIATELY
@@ -730,6 +535,7 @@ void handleButtonPresses() {
       cruise_control_changed = true; // Force immediate transmission
       performance_mode = false; // Disable performance mode
       debugPrintf("🚗 Cruise control OFF\n");
+      Serial.println("Cruise Control OFF");
       displayStatus("Cruise Control OFF");
     }
   }
@@ -753,6 +559,7 @@ void handleButtonPresses() {
         speed_adjustment_made = true;
         last_speed_adjustment = current_time;
         debugPrintf("🚗 Cruise speed INCREASED to: %d\n", current_cruise_speed);
+        Serial.println("Speed +25");
         displayStatus("Speed +25");
       }
       // Maximum backward (Y < -400) - Slow down cruise control
@@ -763,6 +570,7 @@ void handleButtonPresses() {
         speed_adjustment_made = true;
         last_speed_adjustment = current_time;
         debugPrintf("🚗 Cruise speed DECREASED to: %d\n", current_cruise_speed);
+        Serial.println("Speed -25");
         displayStatus("Speed -25");
       }
     }
@@ -775,8 +583,6 @@ void handleButtonPresses() {
   
   button_was_pressed = button_is_pressed;
 }
-
-
 
 void sendAcknowledgment() {
   // Prepare acknowledgment queue item
@@ -812,39 +618,32 @@ void loop() {
   if (gesture_control_enabled && !mpu_initialized) {
     if (current_time - mpu_init_start_time >= MPU_INIT_DURATION) {
       mpu_initialized = true;
-      displayStatus("Gesture Control Ready!");
+      Serial.println("Gesture Control Ready!");
       Serial.println("MPU6050 initialization complete");
       delay(1000); // Show completion message for 1 second
     }
   }
   
-  // Check battery status
-  checkBatteryStatus();
-  
   // Read inputs
   readJoystick();
   
-  // Debug: Test if readButtons is being called
+  // Debug: Test if readCruiseButton is being called
   static unsigned long last_button_test = 0;
   if (current_time - last_button_test > 3000) {
-    debugPrint("🔍 readButtons() function called\n");
+    debugPrint("🔍 readCruiseButton() function called\n");
     last_button_test = current_time;
   }
   
-  readButtons();
+  readCruiseButton();
   // Skip MPU readings in performance mode for instant response
   if (!performance_mode) {
     readMPU6050();
   }
-  handleButtonPresses();
+  handleCruiseButtonPress();
   
   // Update display (skip in performance mode for instant response)
   if (!performance_mode) {
-    if (low_battery_warning) {
-      displayLowBatteryWarning();
-    } else {
-      updateDisplay();
-    }
+    updateDisplay();
   }
   
   // Send data via ESP-NOW with change threshold
@@ -886,6 +685,9 @@ void loop() {
     
     sendData();
     last_send_time = current_time;
+    
+    // Process transmission queue
+    processTransmissionQueue();
     
     // Small delay to prevent overwhelming the system
     delay(2);
@@ -936,9 +738,9 @@ bool hasSignificantChange() {
   bool buttons_changed = (controller_data.button_states != last_sent_data.button_states);
   
   // Check if MPU values have changed significantly (if gesture control is enabled)
-      bool mpu_changed = false;
-    // MPU data removed from struct to eliminate alignment issues
-  
+  bool mpu_changed = false;
+  // MPU data removed from struct to eliminate alignment issues
+
   // Debug: Show change detection (every 5 seconds, skip in performance mode)
   if (!performance_mode) {
     static unsigned long last_change_debug = 0;
@@ -1004,13 +806,7 @@ void processTransmissionQueue() {
       // Transmission failed immediately
       transmission_in_progress = false;
       consecutive_failures++;
-      Serial.printf("❌ Transmission failed: %d (ESP_ERR_ESPNOW_NOT_FOUND=%d)\n", result, ESP_ERR_ESPNOW_NOT_FOUND);
-      if (result == ESP_ERR_ESPNOW_NOT_FOUND) {
-        Serial.println("   → Peer not found - trying to re-add broadcast peer");
-        esp_now_del_peer(broadcast_mac);
-        esp_err_t retry_result = esp_now_add_peer(&broadcast_peer);
-        Serial.printf("   → Retry result: %d\n", retry_result);
-      }
+      Serial.printf("❌ Transmission failed: %d\n", result);
     }
   }
 }
@@ -1046,132 +842,46 @@ void sendData() {
   // Update cruise control data
   controller_data.cruise_control_active = cruise_control_enabled;
   controller_data.cruise_speed = current_cruise_speed;
-  controller_data.operation_mode = current_mode;
   
-  // Send directly via ESP-NOW broadcast (no queue needed)
-  esp_err_t result = esp_now_send(broadcast_mac, (uint8_t*)&controller_data, sizeof(controller_data));
+  // Cruise control state change is now handled in main loop for immediate response
   
-  if (result == ESP_OK) {
-    // Success - update last sent data for change detection
-    memcpy(&last_sent_data, &controller_data, sizeof(controller_data_t));
-    
-    // Reset failure counter on success
-    if (consecutive_failures > 0) {
-      consecutive_failures = 0;
-      connection_warning_shown = false;
+  // Debug: Show cruise control data being sent
+  static unsigned long last_cruise_debug = 0;
+  if (millis() - last_cruise_debug > 2000) {
+    debugPrintf("🚗 Cruise control data: enabled=%s, speed=%d, struct_size=%d\n", 
+                 cruise_control_enabled ? "YES" : "NO", 
+                 current_cruise_speed, 
+                 sizeof(controller_data_t));
+    last_cruise_debug = millis();
+  }
+  
+  // Prepare queue item
+  queue_item_t item;
+  
+  // Send via broadcast
+  memcpy(item.mac, broadcast_mac, 6);
+  item.is_ack = false;
+  
+  memcpy(item.data, &controller_data, sizeof(controller_data));
+  item.data_len = sizeof(controller_data);
+  
+  // Try to add to queue (non-blocking)
+  if (xQueueSend(esp_now_queue, &item, 0) == pdTRUE) {
+    // Successfully queued
+    static unsigned long send_count = 0;
+    send_count++;
+    if (send_count % 50 == 0) {
+      debugPrintf("📦 Queued data - Mode:BROADCAST X:%d Y:%d Quality:%d%% Size:%d bytes\n", 
+                   controller_data.joystick_x, controller_data.joystick_y, connection_quality, sizeof(controller_data_t));
     }
-    
-    // Debug: Show successful transmission
-    static unsigned long success_count = 0;
-    success_count++;
-    if (success_count % 50 == 0) {
-      debugPrintf("✅ TX Success #%d - X:%d Y:%d Size:%d bytes\n", 
-                   success_count, controller_data.joystick_x, controller_data.joystick_y, sizeof(controller_data_t));
+  } else {
+    // Queue is full - this prevents packet corruption!
+    static unsigned long queue_full_count = 0;
+    queue_full_count++;
+    if (queue_full_count % 10 == 0) {
+      Serial.printf("⚠️ Queue full - dropped packet (count: %d)\n", queue_full_count);
     }
-  } else {
-    // Send failed
-    consecutive_failures++;
-    Serial.printf("❌ Send failed: %d\n", result);
   }
-}
-
-void updateDisplay() {
-  // Debug: Print display update every 5 seconds
-  static unsigned long last_display_debug = 0;
-  if (millis() - last_display_debug > 5000) {
-    Serial.println("Updating display...");
-    last_display_debug = millis();
-  }
-  
-  display.clearDisplay();
-  
-  // Display title and connection status
-  display.setCursor(0, 0);
-  display.println("Golf Cart Controller");
-  
-  // Show connection status
-  display.setCursor(0, 9);
-  display.print("ESP-NOW: ");
-  if (consecutive_failures >= MAX_FAILURES) {
-    display.print("FAILED");
-  } else if (consecutive_failures > 0) {
-    display.print("WEAK");
-  } else {
-    display.print("OK");
-  }
-  
-  // Show connection status
-  display.setCursor(0, 18);
-  display.print("Status: ");
-  if (receiver_connected) {
-    display.print("BROADCAST");
-  } else {
-    display.print("DISCONNECTED");
-  }
-  
-  display.drawLine(0, 30, 128, 30, SSD1306_WHITE);
-  
-  // Display battery levels
-  display.setCursor(0, 35);
-  display.print("Ctrl:");
-  display.print(controller_data.battery_level);
-  display.print("% Cart:");
-  display.print(85); // Default value since cart_battery_level was removed
-  display.print("%");
-  
-  // Display operation mode
-  display.setCursor(0, 45);
-  display.print("Op Mode: ");
-  switch (current_mode) {
-    case MODE_NORMAL:
-      display.print("Normal");
-      break;
-    case MODE_TURBO:
-      display.print("Turbo");
-      break;
-    case MODE_FOLLOW_ME:
-      display.print("Follow");
-      break;
-    case MODE_PARKING:
-      display.print("Parking");
-      break;
-  }
-  
-  // Show toggle states
-  display.setCursor(0, 55);
-  display.print("ES:");
-  display.print(emergency_stop_enabled ? "ON" : "OFF");
-  display.print(" CC:");
-  display.print(cruise_control_enabled ? "ON" : "OFF");
-  display.print(" AR:");
-  display.print(auto_reconnect_enabled ? "ON" : "OFF");
-  
-  // Show cruise speed when active
-  if (cruise_control_enabled) {
-    display.setCursor(0, 45);
-    display.print("Cruise Speed: ");
-    display.print(current_cruise_speed);
-  }
-  
-  // Show debug mode status
-  display.setCursor(0, 35);
-  display.print("Debug: ");
-  display.print(debug_mode_enabled ? "ON" : "OFF");
-  
-  display.display();
-}
-
-void displayStatus(const char* message) {
-  display.clearDisplay();
-  display.setCursor(0, 20);
-  display.println(message);
-  display.display();
-  
-  // Only delay for non-critical messages to avoid blocking cruise control
-  if (strstr(message, "Cruise Control") == NULL) {
-    delay(2000);
-  }
-  // For cruise control messages, show immediately without delay
 }
 
 void OnDataSent(const wifi_tx_info_t *tx_info, esp_now_send_status_t sendStatus) {
@@ -1236,89 +946,6 @@ void OnDataRecv(const esp_now_recv_info *recv_info, const uint8_t *data, int dat
   sendAcknowledgment();
 }
 
-// Battery monitoring functions
-void checkBatteryStatus() {
-  unsigned long current_time = millis();
-  
-  // Check battery status every second
-  if (current_time - last_battery_check >= BATTERY_CHECK_INTERVAL) {
-    last_battery_check = current_time;
-    
-    // Read PowerBoost 1000C LBO pin
-    // LBO is LOW when battery is low, HIGH when battery is OK
-    bool current_lbo_state = digitalRead(LBO_PIN);
-    
-    // Detect low battery condition (LBO pin goes LOW)
-    if (!current_lbo_state && last_lbo_state) {
-      // Transition from HIGH to LOW - battery just went low
-      low_battery_warning = true;
-      low_battery_warning_shown = false;
-      Serial.println("🔋 LOW BATTERY WARNING: PowerBoost LBO pin triggered!");
-      debugPrintf("🔋 Battery voltage dropped below threshold\n");
-    } else if (current_lbo_state && !last_lbo_state) {
-      // Transition from LOW to HIGH - battery recovered
-      low_battery_warning = false;
-      low_battery_warning_shown = false;
-      Serial.println("🔋 Battery voltage recovered - warning cleared");
-      debugPrintf("🔋 Battery voltage above threshold\n");
-    }
-    
-    last_lbo_state = current_lbo_state;
-    
-    // Debug: Show LBO pin state every 10 seconds
-    static unsigned long last_lbo_debug = 0;
-    if (current_time - last_lbo_debug > 10000) {
-      debugPrintf("🔋 LBO Pin: %s, Warning: %s\n", 
-                  current_lbo_state ? "HIGH (OK)" : "LOW (BATTERY LOW)",
-                  low_battery_warning ? "ACTIVE" : "INACTIVE");
-      last_lbo_debug = current_time;
-    }
-  }
-}
-
-void displayLowBatteryWarning() {
-  unsigned long current_time = millis();
-  
-  // Toggle display state for blinking effect
-  if (current_time - low_battery_blink_time >= LOW_BATTERY_BLINK_INTERVAL) {
-    low_battery_display_on = !low_battery_display_on;
-    low_battery_blink_time = current_time;
-  }
-  
-  // Clear display
-  display.clearDisplay();
-  
-  if (low_battery_display_on) {
-    // Display warning message
-    display.setTextSize(2);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(10, 10);
-    display.println("LOW");
-    display.setCursor(10, 35);
-    display.println("BATTERY");
-    
-    // Add battery icon
-    display.setTextSize(1);
-    display.setCursor(5, 55);
-    display.println("Charge Now!");
-    
-    // Draw battery outline
-    display.drawRect(100, 15, 20, 10, SSD1306_WHITE);
-    display.drawRect(120, 18, 3, 4, SSD1306_WHITE);
-    // Fill battery partially to show low level
-    display.fillRect(102, 17, 6, 6, SSD1306_WHITE);
-  }
-  
-  display.display();
-  
-  // Show warning message in serial only once
-  if (!low_battery_warning_shown) {
-    Serial.println("🔋 ⚠️  LOW BATTERY WARNING DISPLAYED ⚠️  🔋");
-    Serial.println("🔋 Please charge your controller battery immediately!");
-    low_battery_warning_shown = true;
-  }
-}
-
 // Debug print functions - only output if debug mode is enabled
 void debugPrint(const char* message) {
   if (debug_mode_enabled) {
@@ -1332,3 +959,59 @@ void debugPrintf(const char* format, ...) {
   }
 }
 
+void updateDisplay() {
+  // Debug: Print display update every 5 seconds
+  static unsigned long last_display_debug = 0;
+  if (millis() - last_display_debug > 5000) {
+    Serial.println("Updating display...");
+    last_display_debug = millis();
+  }
+  
+  display.clearDisplay();
+  
+  // Display title
+  display.setCursor(0, 0);
+  display.println("Nano Controller");
+  
+  // Show connection status
+  display.setCursor(0, 8);
+  display.print("ESP-NOW: ");
+  if (consecutive_failures >= MAX_FAILURES) {
+    display.print("FAILED");
+  } else if (consecutive_failures > 0) {
+    display.print("WEAK");
+  } else {
+    display.print("OK");
+  }
+  
+  // Show battery level
+  display.setCursor(0, 16);
+  display.print("Battery: ");
+  display.print(controller_data.battery_level);
+  display.print("%");
+  
+  // Show cruise control status
+  display.setCursor(0, 24);
+  display.print("Cruise: ");
+  if (cruise_control_enabled) {
+    display.print("ON ");
+    display.print(current_cruise_speed);
+  } else {
+    display.print("OFF");
+  }
+  
+  display.display();
+}
+
+void displayStatus(const char* message) {
+  display.clearDisplay();
+  display.setCursor(0, 12);
+  display.println(message);
+  display.display();
+  
+  // Only delay for non-critical messages to avoid blocking cruise control
+  if (strstr(message, "Cruise Control") == NULL) {
+    delay(2000);
+  }
+  // For cruise control messages, show immediately without delay
+}

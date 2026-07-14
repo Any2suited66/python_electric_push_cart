@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Cart Follow</string>
+    <string name="pi_ip_hint">Pi USB IP override (blank = auto; e.g. 10.141.179.71)</string>
+    <string name="hole_hint">Hole (1–18)</string>
+    <string name="scan_connect">Connect to Pi</string>
+    <string name="calibrate">Calibrate</string>
+    <string name="recalibrate">Re-calibrate</string>
+    <string name="calibrating">Calibrating…</string>
+    <string name="scanning">Connecting…</string>
+    <string name="disconnect">Disconnect</string>
+    <string name="status_idle">Idle — USB tether + Pi controller running, then Connect</string>
+    <string name="status_connected">Connected — tap Calibrate when ready</string>
+    <string name="status_reconnected">Reconnected — calibration kept</string>
+    <string name="calibrate_connect_first">Connect to the Pi first</string>
+    <string name="calib_hint">Stand centered in frame</string>
+    <string name="calib_get_ready">Get ready…</string>
+    <string name="calib_prep_face">Face the camera — starting in…</string>
+    <string name="calib_prep_back">Turn around — back to camera</string>
+    <string name="calib_turn_now">Beep — turn around now</string>
+    <string name="calib_face_hold">Front — hold still</string>
+    <string name="calib_back_hold">Back — hold still</string>
+    <string name="calib_countdown">Hold still — %1$d</string>
+    <string name="calib_hold_still">Hold still…</string>
+    <string name="calib_complete">Calibration complete</string>
+    <string name="calib_failed">Calibration failed — try again</string>
+    <string name="notification_tracking">Following cart — screen may turn off</string>
+    <string name="notification_channel_name">Cart follow</string>
+    <string name="notification_channel_desc">Keeps camera and GPS running when screen is off</string>
+    <string name="notification_title">Cart Follow</string>
+</resources>

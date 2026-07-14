@@ -114,6 +114,7 @@ void loop() {
     new_data_received = false;
   }
   
+  
   // Simple timing - use moderate speed to avoid Serial Monitor corruption
   delay(performance_mode ? 25 : 50); // 40Hz instead of 100Hz to prevent corruption
 }

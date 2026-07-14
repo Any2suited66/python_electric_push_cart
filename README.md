@@ -1,268 +1,142 @@
-# 🏌️ Electric Golf Cart Controller
+# Electric Golf Push Cart
 
-A wireless remote-controlled 3-wheel electric golf cart using hoverboard motors, Raspberry Pi Zero 2W, and ESP32 microcontrollers.
+Motorized 3-wheel golf push cart using hoverboard motors, a Raspberry Pi Zero 2W, an ESP32 handheld remote, and phone-camera follow-me with Matrix LiDAR distance.
 
-## 📋 Overview
+## Architecture
 
-This project transforms a standard golf push cart into a motorized, remote-controlled vehicle using:
-- **Hoverboard motors** for propulsion and steering
-- **Raspberry Pi Zero 2W** as the main controller
-- **ESP32 microcontrollers** for wireless communication
-- **Differential steering** for smooth turning
-
-## 🏗️ Hardware Components
-
-### Core System
-- **Raspberry Pi Zero 2W** - Main controller running Python
-- **2x Hoverboard Motors** - Brushless DC motors with built-in controllers
-- **3-Wheel Golf Cart Frame** - Standard golf cart modified for motorization
-
-### Wireless Control System
-- **ESP32 Controller** - Handles joystick input and wireless transmission
-- **ESP32 Receiver** - Receives control data and forwards to Raspberry Pi
-- **HotRC DS600 Joystick** - Single-axis controller with tank-style steering
-
-### Power & Safety
-- **36V Battery Pack** - Powers hoverboard motors
-- **5V Power Supply** - Powers Raspberry Pi and ESP32s
-- **Emergency Stop System** - ESP-NOW signal loss detection with automatic stop
-
-## 🔧 Hardware Setup
-
-### Motor Connections
-```
-Hoverboard Motors:
-├── Left Motor:  UART TX (GPIO 14) → Motor Controller
-├── Right Motor: UART RX (GPIO 15) → Motor Controller
-└── Power:       36V Battery → Motor Controllers
+```mermaid
+flowchart LR
+  remote[Nano_ESP32_remote] -->|"ESP-NOW"| receiver[ESP32_receiver]
+  receiver -->|"USB serial 115200"| pi[hoverboard_minimal.py]
+  phone[Android_CartFollow] -->|"USB tether TCP :9747"| bridge[phone_bridge]
+  lidar[SEN0628_Matrix_LiDAR] -->|"USB serial"| lidarMod[matrix_lidar]
+  bridge --> pi
+  lidarMod --> pi
+  pi -->|"UART /dev/ttyAMA0"| motors[Hoverboard_FOC_motors]
 ```
 
-### ESP32 Pinout
-```
-Controller ESP32:
-├── GPIO 20: X-axis (Steering)
-├── GPIO 16: Y-axis (Speed/Throttle)
-└── USB:     Power and data to receiver
+| Path | Role |
+|------|------|
+| Remote → ESP-NOW → receiver → USB | Joystick drive, cruise, mode selects, summon / e-stop |
+| Phone → TCP `:9747` | Follow-me **steering** (pose tracking) |
+| Matrix LiDAR on Pi | Follow-me **throttle** (target ~200 cm); phone body-size is backup |
+| Pi → hoverboard UART | Differential steer/speed commands |
 
-Receiver ESP32:
-├── USB:     Data to Raspberry Pi
-└── GPIO 2:  Status LED
-```
+Phone follow details: [android/CartFollow/README.md](android/CartFollow/README.md).
 
-### Raspberry Pi Connections
-```
-Raspberry Pi Zero 2W:
-├── UART TX (GPIO 14): → Hoverboard Left Motor
-├── UART RX (GPIO 15): → Hoverboard Right Motor
-├── USB:               → ESP32 Receiver
-└── Power:             5V supply
-```
+## Repo map
 
+| Path | Purpose |
+|------|---------|
+| [`hoverboard_minimal.py`](hoverboard_minimal.py) | Main Pi controller |
+| [`phone_bridge.py`](phone_bridge.py) | TCP listener for Cart Follow packets |
+| [`matrix_lidar.py`](matrix_lidar.py) | DFRobot SEN0628 distance → throttle |
+| [`cart_protocol.py`](cart_protocol.py) | Shared `0xAA`…`0xBB` packet framing |
+| [`phone_gps.py`](phone_gps.py) | Optional GPS helpers (summon logging) |
+| [`golf_green_yardages.py`](golf_green_yardages.py) | Course green yardage POC |
+| [`minimal_controller.ino`](minimal_controller.ino) | Handheld Nano ESP32 firmware (current) |
+| [`receiver_minimal/`](receiver_minimal/) | Cart-side ESP32 ESP-NOW → USB bridge |
+| [`android/CartFollow/`](android/CartFollow/) | Pose-tracking follow app |
+| [`hoverboard-controller.service`](hoverboard-controller.service) | systemd unit for boot |
+| [`GOLF_STATS.md`](GOLF_STATS.md) | Round-stats feature spec |
+| `controller/`, `controller_nano/` | Older remote firmwares (legacy) |
 
+## Hardware
 
-## 🚀 Quick Start
+- **Pi Zero 2W** — runs `hoverboard_minimal.py`
+- **2× hoverboard motors** — EFeru FOC firmware ([hoverboard-firmware-hack-FOC](https://github.com/EFeru/hoverboard-firmware-hack-FOC)), UART at **115200** on `/dev/ttyAMA0`
+- **Arduino Nano ESP32** — handheld remote (joystick + buttons + OLED)
+- **ESP32 receiver** — USB to Pi, ESP-NOW from remote
+- **Phone** — Cart Follow app over USB tethering
+- **DFRobot SEN0628 Matrix LiDAR** — USB-C into the Pi hub (8×8 text stream @ 115200); optional I2C via `MATRIX_LIDAR_MODE=i2c`
+- **MPU6050 on Pi (I2C)** — tilt cutout (~5°)
+- **Power** — 36 V motors; 5 V for Pi / ESP32s / logic
 
-### 1. Flash Hoverboard Firmware
+Typical Pi USB hub: ESP32 receiver + LiDAR (+ optional phone tether / GPS).
 
-**Hoverboard Motor Controllers:**
-```bash
-# Flash the custom FOC firmware from EFeru's repository
-# https://github.com/EFeru/hoverboard-firmware-hack-FOC
-# This provides Field Oriented Control for smooth motor operation
-```
+Remote pins (Nano ESP32, from `minimal_controller.ino`): joystick X=`A1`, Y=`A0`, stick button=`D2`; Buttons 1–4 on `D3`–`D6`; SSD1306 on GPIO 8/9; remote MPU on GPIO 10/11.
 
-### 2. Flash ESP32 Firmware
+## Quick start
 
-**Controller ESP32:**
-```bash
-# Upload controller.ino to the joystick controller ESP32
-# This handles joystick input and wireless transmission
-```
+### 1. Flash motor + ESP32 firmware
 
-**Receiver ESP32:**
-```bash
-# Upload receiver_minimal.ino to the receiver ESP32
-# This receives data and forwards to Raspberry Pi via USB
-```
+1. Flash both hoverboard boards with EFeru FOC firmware.
+2. Upload [`minimal_controller.ino`](minimal_controller.ino) to the handheld Nano ESP32.
+3. Upload [`receiver_minimal/receiver_minimal.ino`](receiver_minimal/receiver_minimal.ino) to the cart receiver ESP32.
 
-### 3. Install Dependencies
+### 2. Pi dependencies
 
 ```bash
-# Install Python serial library
-pip install pyserial
-
-# Or install system-wide
-sudo apt-get install python3-serial
+pip install -r requirements.txt
+# pyserial, smbus2
 ```
 
-### 4. Run the Controller
+Optional green-yardage POC:
 
 ```bash
-# Run the main control script
-python3 hoverboard_minimal.py
-
-# Or run the reference implementation
-python3 hoverboard_controller.py
+pip install -r requirements-golf.txt
 ```
 
-## 🎮 Control System
-
-### Joystick Operation
-- **Y-Axis (Forward/Backward)**: Controls speed and direction
-- **X-Axis (Left/Right)**: Controls steering
-- **Tank-Style Mixing**: `left_motor = throttle + steering`, `right_motor = throttle - steering`
-
-### Operation Modes
-- **Normal Mode**: 70% max speed
-- **Turbo Mode**: 100% max speed
-- **Follow-Me Mode**: 50% max speed
-- **Parking Mode**: 30% max speed
-
-### Safety Features
-- **Emergency Stop**: ESP-NOW signal loss detection with automatic stop
-- **Signal Loss Protection**: Automatic stop after 3 seconds of no data
-- **Joystick Deadzone**: Prevents motor jitter from small movements
-- **Smooth Acceleration**: Configurable acceleration/deceleration rates
-
-## 🔧 Configuration
-
-### Motor Control Parameters
-```python
-# In hoverboard_minimal.py
-MAX_SPEED = 400        # Maximum motor speed
-MAX_STEERING = 600     # Maximum steering angle
-ACCEL_RATE = 5.0       # Acceleration rate (units/second)
-DECEL_RATE = 8.0       # Deceleration rate (units/second)
-STEER_RATE = 10.0      # Steering rate (units/second)
-```
-
-### Communication Settings
-```python
-# ESP32 Communication
-ESP32_BAUDRATE = 115200
-HOVERBOARD_BAUDRATE = 9600
-COMMAND_RATE = 20      # Hz (commands per second)
-```
-
-### Safety Timeouts
-```python
-DATA_TIMEOUT = 3.0     # Seconds before emergency stop
-EMERGENCY_STOP_DURATION = 2.0  # Seconds to clear emergency stop
-```
-
-## 🛠️ Troubleshooting
-
-### Common Issues
-
-**Motors Not Responding:**
-1. Check UART connections (GPIO 14/15)
-2. Verify hoverboard power supply
-3. Check motor controller connections
-4. Test with `test_hoverboard.py`
-
-**No Wireless Control:**
-1. Verify ESP32 firmware is uploaded
-2. Check USB connections
-3. Monitor serial output for connection status
-4. Ensure both ESP32s are powered
-
-**Erratic Movement:**
-1. Check for EMI interference (add aluminum foil shielding)
-2. Verify joystick calibration
-3. Check for loose connections
-4. Monitor signal quality in logs
-
-### Debug Commands
+### 3. Run the controller
 
 ```bash
-# Test hoverboard communication
-python3 test_hoverboard.py
-
-# Monitor USB ports
-ls /dev/ttyUSB*
-
-# Check UART permissions
-sudo usermod -a -G dialout $USER
+python3 hoverboard_minimal.py          # debug logging (default)
+python3 hoverboard_minimal.py --silent # production / systemd
 ```
 
-## 🔒 Safety Considerations
+Phone bridge (`:9747`) and LiDAR follow start with the controller.
 
-### Critical Safety Features
-- **Emergency Stop**: Always functional via ESP-NOW signal loss detection
-- **Signal Loss Protection**: Automatic stop on communication failure
-- **Speed Limits**: Configurable maximum speeds for each mode
-- **EMI Shielding**: Aluminum foil around hoverboard motherboard
+For boot: edit [`hoverboard-controller.service`](hoverboard-controller.service) (`User` / `Group`), copy it to `/etc/systemd/system/`, then `daemon-reload` / `enable --now`. Paths use `%h` (that user's home), so no absolute home path is needed.
 
-### Operating Guidelines
-- Always test in open area first
-- Keep ESP32 controller accessible for emergency stop
-- Monitor battery levels
-- Check all connections before use
-- Start in low-speed modes
+### 4. Follow-me (phone + LiDAR)
 
-## 📊 Technical Specifications
+1. USB-tether the phone to the Pi, enable USB tethering on the phone.
+2. Open **Cart Follow**, calibrate, then **Scan & Connect to Pi**.
+3. On the remote, cycle Button 1 to **FOLLOW** mode.
 
-### Performance
-- **Max Speed**: ~15-20 mph (configurable)
-- **Control Range**: ~100m (ESP32 wireless)
-- **Response Time**: <50ms
-- **Battery Life**: 6-8 hours (depending on usage)
+Full steps and tuning: [android/CartFollow/README.md](android/CartFollow/README.md).
 
-### Communication Protocol
-- **ESP-NOW**: Direct wireless between ESP32s
-- **UART**: 9600 baud to hoverboard motors
-- **USB Serial**: 115200 baud to Raspberry Pi
+## Operating modes
 
-### Hoverboard Protocol
-```
-Command Format: <start_frame><steer><speed><checksum>
-- start_frame: 0xABCD (16-bit)
-- steer: Differential steering (-32767 to 32767)
-- speed: Average speed (-32767 to 32767)
-- checksum: XOR of start_frame, steer, and speed
-```
+### Handheld remote
 
-## 🤝 Contributing
+| Control | Action |
+|---------|--------|
+| Joystick Y / X | Throttle / steering (tank mix on Pi) |
+| Button 1 | Cycle modes: **NORM → TURBO → FOLLOW → PARK** (OLED; turbo boost currently disabled in firmware) |
+| Button 2 | Cruise on/off (hold stick F/B to trim speed while cruising) |
+| Button 3 (in FOLLOW) | **Double-tap** summon (approach → 180° → pause); **single-tap** resume; **hold ~5 s** recalibrate |
+| Joystick click | Emergency stop toggle |
 
-1. Test thoroughly before submitting changes
-2. Maintain safety features
-3. Document any new features
-4. Follow existing code style
+Follow-me only engages when Cart Follow is connected and calibrated; otherwise the Pi stays on joystick control.
 
-## 📄 License
+### Follow-me motion split
 
-This project is for educational and personal use. Please ensure compliance with local regulations for motorized vehicles.
+| Input | Source |
+|-------|--------|
+| Steering | Phone pose tracking |
+| Throttle / distance | Matrix LiDAR (primary); phone torso-size estimate if LiDAR has no reading |
+| No person | Stop |
 
-## ⚠️ Disclaimer
+### Safety
 
-This project involves high-voltage motors and moving parts. Use at your own risk. Always prioritize safety and test in controlled environments.
+- Remote e-stop and ESP-NOW / link loss → stop
+- MPU6050 tilt threshold on the Pi
+- Joystick deadzone and smoothed accel/decel
+- Follow-me blocked until phone calibration succeeds
 
----
+## Golf helpers (optional)
 
-**Built with ❤️ for golf cart automation**
+- [`golf_green_yardages.py`](golf_green_yardages.py) + [`golf_courses/`](golf_courses/) — offline green F/M/B yardages POC
+- Planned automatic round logging / touchscreen wizard: [GOLF_STATS.md](GOLF_STATS.md)
 
-## 🚧 TODO / Future Enhancements
+## Roadmap
 
-### 🤖 Follow-Me Mode
-- **Ultrasonic Sensors**: Distance measurement for following
-- **Infrared Beacon**: Wearable IR transmitter for tracking
-- **Path Planning**: Smooth following algorithm
-- **Obstacle Avoidance**: Prevent collisions while following
+- Terrain-aware stop / curb crawl / soft-terrain pass-through (LiDAR grid + camera)
+- Rope / fence detection (~0.5 m scan plane)
+- Cart-path-only geofencing from course maps
+- Golf stats phases in [GOLF_STATS.md](GOLF_STATS.md) (GPS on summon, hole wizard, home sync)
 
-### 👁️ Object Detection
-- **Camera Integration**: Raspberry Pi Camera Module
-- **Computer Vision**: OpenCV for obstacle detection
-- **LIDAR/Laser Sensors**: Precise distance measurement
-- **Safety Zones**: Configurable detection ranges
+## Safety
 
-### 🎮 Remote Control Designs
-- **Custom Controller**: 3D-printed ergonomic design
-- **Smartphone App**: Bluetooth/WiFi control interface
-- **Voice Commands**: Speech recognition for hands-free operation
-- **Gesture Control**: Motion-based steering
-
-### 🔧 Additional Features
-- **GPS Navigation**: Autonomous waypoint following
-- **Battery Management**: Smart charging and monitoring
-- **Speed Profiles**: Terrain-adaptive speed control
-- **Data Logging**: Trip recording and analytics
+High-voltage motors and a moving cart. Test in open space, keep the remote reachable for e-stop, and verify wiring before every outing. Use at your own risk and follow local rules for motorized vehicles on courses / paths.
