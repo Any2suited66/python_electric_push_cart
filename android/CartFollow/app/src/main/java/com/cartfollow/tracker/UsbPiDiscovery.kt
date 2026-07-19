@@ -6,9 +6,7 @@ import android.util.Log
 import java.io.BufferedReader
 import java.io.FileReader
 import java.net.Inet4Address
-import java.net.InetSocketAddress
 import java.net.NetworkInterface
-import java.net.Socket
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -39,29 +37,39 @@ object UsbPiDiscovery {
             return Result(emptyList(), emptyList(), "no-usb")
         }
 
+        // Merge all sources (priority order). Never stop at tether-clients/ARP alone —
+        // those lists can be wrong/stale while the Pi is still on the phone's /24.
+        val hosts = linkedSetOf<String>()
+        val methods = mutableListOf<String>()
+
         val tetherClients = tetheredClientIps(context)
         if (tetherClients.isNotEmpty()) {
             Log.i(TAG, "Tethered clients: $tetherClients")
-            return Result(tetherClients, phoneIps, "tether-clients")
+            hosts.addAll(tetherClients)
+            methods.add("tether-clients")
         }
 
         val arp = arpOnUsb(usbIfaces.map { it.name }.toSet(), usbIfaces.map { it.prefix }.toSet())
         if (arp.isNotEmpty()) {
             Log.i(TAG, "USB ARP neighbors: $arp")
-            return Result(arp, phoneIps, "arp")
+            hosts.addAll(arp)
+            methods.add("arp")
         }
 
-        // Full /24 candidates for each USB subnet (Pi DHCP can be any octet, e.g. .71).
-        val hosts = linkedSetOf<String>()
+        // Full /24 for each USB subnet (Pi DHCP can be any octet, e.g. .71).
+        var subnetAdded = 0
         for (iface in usbIfaces) {
             for (o in 1..254) {
-                if (o != iface.selfOctet) {
-                    hosts.add("${iface.prefix}.$o")
+                if (o != iface.selfOctet && hosts.add("${iface.prefix}.$o")) {
+                    subnetAdded++
                 }
             }
         }
-        Log.i(TAG, "USB subnet scan list size=${hosts.size}")
-        return Result(hosts.toList(), phoneIps, "usb-subnet-scan")
+        if (subnetAdded > 0) methods.add("usb-subnet-scan")
+
+        val method = methods.joinToString("+").ifEmpty { "empty" }
+        Log.i(TAG, "USB host candidates size=${hosts.size} method=$method")
+        return Result(hosts.toList(), phoneIps, method)
     }
 
     /**
@@ -72,7 +80,7 @@ object UsbPiDiscovery {
         if (hosts.isEmpty()) return null
         if (hosts.size <= 8) {
             for (host in hosts) {
-                if (probe(host, port)) return host
+                if (probe(context, host, port)) return host
             }
             return null
         }
@@ -84,7 +92,7 @@ object UsbPiDiscovery {
             for (host in hosts) {
                 pool.execute {
                     try {
-                        if (found.get() == null && probe(host, port)) {
+                        if (found.get() == null && probe(context, host, port)) {
                             found.compareAndSet(null, host)
                         }
                     } finally {
@@ -92,8 +100,8 @@ object UsbPiDiscovery {
                     }
                 }
             }
-            // Don't wait forever — first hit wins; allow up to ~8s for a /24.
-            latch.await(8, TimeUnit.SECONDS)
+            // /24 @ 32-wide with ~180ms probes needs ~1.5–3s; keep headroom.
+            latch.await(15, TimeUnit.SECONDS)
         } finally {
             pool.shutdownNow()
         }
@@ -102,16 +110,10 @@ object UsbPiDiscovery {
         return hit
     }
 
-    private fun probe(host: String, port: Int): Boolean {
-        return try {
-            Socket().use { sock ->
-                sock.tcpNoDelay = true
-                sock.connect(InetSocketAddress(host, port), PROBE_MS)
-                true
-            }
-        } catch (_: Exception) {
-            false
-        }
+    private fun probe(@Suppress("UNUSED_PARAMETER") context: Context, host: String, port: Int): Boolean {
+        // Single USB-bound attempt — multi-path connectSocket is for real connects,
+        // not /24 scans (stacked timeouts caused false "no Pi" misses).
+        return CartNetwork.probeUsbPort(host, port, PROBE_MS)
     }
 
     private data class UsbIface(val name: String, val ip: String, val prefix: String, val selfOctet: Int)

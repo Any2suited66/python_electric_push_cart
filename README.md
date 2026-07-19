@@ -96,6 +96,45 @@ For boot: edit [`hoverboard-controller.service`](hoverboard-controller.service) 
 
 Full steps and tuning: [android/CartFollow/README.md](android/CartFollow/README.md).
 
+**USB tether / “No Pi on USB :9747”:** Samsung changes the USB `10.x` subnet each session. The phone may be e.g. `10.211.203.222` while the Pi still has a stale `usb0` like `10.141.179.2`. The app only scans the phone’s `/24`, so Connect fails until the Pi renews onto that subnet.
+
+On the Pi (while tethered):
+
+```bash
+ip -4 addr show usb0
+# Prefer the renew script (flush + DHCP + drops USB default route so Wi‑Fi stays WAN).
+# Do NOT run bare `dhclient` alone — phone DHCP steals the default route and breaks SSH/Wi‑Fi.
+sudo /usr/local/bin/usb0-dhcp-renew.sh usb0   # after installing the unit/script
+# Manual equivalent only if needed:
+#   sudo ip addr flush dev usb0 && sudo dhclient -v usb0 && sudo ip route del default dev usb0
+ip -4 addr show usb0    # must match phone USB /24
+ss -lntp | grep 9747    # hoverboard_minimal / phone_bridge must listen
+```
+
+**Never** make `usb0` the default gateway or pin it to a static old `10.141.x.x` address.
+
+Install auto-renew once (script flushes then renews when `usb0` appears):
+
+```bash
+sudo cp scripts/usb0-dhcp-renew.sh /usr/local/bin/
+sudo chmod +x /usr/local/bin/usb0-dhcp-renew.sh
+sudo cp scripts/usb0-dhcp-renew.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable usb0-dhcp-renew.service
+```
+
+Leave the app Pi IP field **blank** (auto-scan). Typed IPs on another `/24` are treated as stale and ignored.
+
+**Wi‑Fi / SSH dies after tether renew:** Phone DHCP often pushes a *default* route via `usb0`, so traffic leaves through the phone instead of `wlan0`. Fix now:
+
+```bash
+ip route                          # look for default via … dev usb0
+sudo ip route del default dev usb0
+ip route                          # default should be via wlan0 again
+```
+
+`scripts/usb0-dhcp-renew.sh` removes that USB default route after renew. Re-copy it to `/usr/local/bin/` if you already installed the unit. While debugging Wi‑Fi you can also unplug the phone or turn off USB tethering.
+
 ## Operating modes
 
 ### Handheld remote

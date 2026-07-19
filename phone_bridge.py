@@ -17,8 +17,9 @@ class PhoneBridge:
     """
     Listen for framed cart packets from the phone app.
 
-    Phone vision provides steering; Pi LiDAR provides throttle. The phone
-    throttle field is used as backup when LiDAR has no reading.
+    Phone vision provides steering + body-size throttle. Pi LiDAR provides
+    metric range PD; hoverboard fuses both when LiDAR is valid (phone leads
+    when you start walking). Phone throttle alone is used if LiDAR is down.
 
     ASCII status lines (CALIB_START, CALIB 3/2/1, CALIB_OK, CALIB_FAIL) may be
     interleaved with binary packets on the same TCP stream.

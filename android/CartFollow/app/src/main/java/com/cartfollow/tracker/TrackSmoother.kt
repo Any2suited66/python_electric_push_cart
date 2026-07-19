@@ -13,6 +13,7 @@ class TrackSmoother {
     private var outputDetected = false
     private var lastGoodSteering = 0
     private var visionAssistUntilMs = 0L
+    private var aimCenterX = 0f
 
     fun update(
         rawDetected: Boolean,
@@ -27,6 +28,7 @@ class TrackSmoother {
         landmarkCount: Int,
         colorMatch: Boolean,
         qualityPass: Boolean,
+        targetCenterX: Float = 0f,
     ): TrackResult {
         if (calibrating) {
             return TrackResult(
@@ -42,6 +44,9 @@ class TrackSmoother {
             )
         }
 
+        val aim = if (targetCenterX > 0f) targetCenterX else (frameWidth / 2f)
+        aimCenterX = aim
+
         val frameGood = rawDetected && qualityPass
         if (frameGood) {
             goodStreak++
@@ -51,8 +56,8 @@ class TrackSmoother {
             } else {
                 smoothCenterX + STEERING_ALPHA * (centerX - smoothCenterX)
             }
-            val targetCenter = smoothCenterX
-            smoothSteering = CartProtocol.steeringFromCenter(targetCenter, frameWidth, null)
+            // Steer toward calibrated aim (not geometric mid-frame only).
+            smoothSteering = CartProtocol.steeringFromCenter(smoothCenterX, frameWidth, aim)
             lastGoodSteering = smoothSteering
             outputDetected = goodStreak >= DET_CONFIRM_FRAMES || outputDetected
             visionAssistUntilMs = System.currentTimeMillis() + VISION_ASSIST_MS
@@ -95,10 +100,11 @@ class TrackSmoother {
         outputDetected = false
         lastGoodSteering = 0
         visionAssistUntilMs = 0L
+        aimCenterX = 0f
     }
 
     companion object {
-        private const val STEERING_ALPHA = 0.38f
+        private const val STEERING_ALPHA = 0.22f
         private const val DET_CONFIRM_FRAMES = 2
         private const val DET_LOST_FRAMES = 3
         private const val VISION_ASSIST_MS = 800L

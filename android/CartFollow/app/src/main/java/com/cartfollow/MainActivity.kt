@@ -16,6 +16,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.cartfollow.databinding.ActivityMainBinding
+import com.cartfollow.tracker.CartNetwork
 import com.cartfollow.tracker.CartProtocol
 import com.cartfollow.tracker.NetworkScanner
 import com.cartfollow.tracker.PiSocketClient
@@ -134,18 +135,29 @@ class MainActivity : AppCompatActivity() {
 
         scanExecutor.execute {
             try {
-                // Optional override: typed IP only.
-                if (manual.isNotEmpty()) {
+                val phoneUsb = CartNetwork.localUsbIpv4s()
+                // Typed IP on a different /24 than phone USB = stale Pi lease; ignore and scan.
+                val useManual = manual.isNotEmpty() && (
+                    phoneUsb.isEmpty() || phoneUsb.any { sameSlash24(it, manual) }
+                )
+                if (manual.isNotEmpty() && !useManual) {
+                    Log.w(TAG, "Ignoring stale Pi IP $manual (phone USB ${phoneUsb.joinToString()})")
+                    runOnUiThread {
+                        setStatus(
+                            "Stale Pi IP $manual — scanning phone USB ${phoneUsb.first()}…",
+                        )
+                    }
+                }
+
+                if (useManual) {
                     runOnUiThread { setStatus("Connecting to $manual…") }
                     if (connectToHost(appCtx, manual, hole)) {
                         return@execute
                     }
-                    finishConnectAttempt(
-                        null,
-                        "Could not reach $manual:$port. " +
-                            "Phone on same Wi‑Fi as Pi? Is hoverboard_minimal.py running?",
-                    )
-                    return@execute
+                    // Wrong/stale IP: fall through to USB scan instead of hard-failing.
+                    runOnUiThread {
+                        setStatus("Could not reach $manual — scanning USB tether…")
+                    }
                 }
 
                 // Golf-course path: USB tether only (no Wi‑Fi needed).
@@ -166,7 +178,10 @@ class MainActivity : AppCompatActivity() {
                 }
                 val host = UsbPiDiscovery.findOpenPort(appCtx, discovery.hosts, port)
                 if (host != null) {
-                    runOnUiThread { setStatus("Connecting to $host (USB)…") }
+                    runOnUiThread {
+                        binding.piIpInput.setText(host)
+                        setStatus("Connecting to $host (USB)…")
+                    }
                     if (connectToHost(appCtx, host, hole)) {
                         return@execute
                     }
@@ -175,13 +190,23 @@ class MainActivity : AppCompatActivity() {
                 finishConnectAttempt(
                     null,
                     "No Pi on USB :$port. phone=${discovery.phoneUsbIps.joinToString()} " +
-                        "Pi should show usb0 (e.g. 10.141.179.71). Is hoverboard_minimal.py running?",
+                        "(${discovery.method}, ${discovery.hosts.size} hosts). " +
+                        "On Pi: ip -4 addr show usb0 && sudo dhclient -v usb0 — " +
+                        "Pi must be on the same 10.x subnet as the phone, and " +
+                        "hoverboard_minimal.py must be listening on :$port.",
                 )
             } catch (e: Exception) {
                 Log.e(TAG, "Connect scan failed", e)
                 finishConnectAttempt(null, "Connect error: ${e.message ?: e.javaClass.simpleName}")
             }
         }
+    }
+
+    private fun sameSlash24(a: String, b: String): Boolean {
+        val da = a.lastIndexOf('.')
+        val db = b.lastIndexOf('.')
+        if (da <= 0 || db <= 0) return false
+        return a.substring(0, da) == b.substring(0, db)
     }
 
     private fun connectToHost(appCtx: android.content.Context, host: String, hole: Int): Boolean {

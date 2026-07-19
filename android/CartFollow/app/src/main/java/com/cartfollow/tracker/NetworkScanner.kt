@@ -73,13 +73,33 @@ object NetworkScanner {
         return hosts.toList()
     }
 
-    /** Pull the first IPv4 from pasted text (e.g. full `hostname -I` output). */
+    /**
+     * Pull an IPv4 from pasted text (e.g. `hostname -I` output).
+     * When several addresses are present, prefer the USB-tether one (10.x / rndis DHCP),
+     * not the Pi's Wi‑Fi address (often 192.168.4.x in this project).
+     */
     fun extractIpv4(raw: String): String? {
-        val match = Regex("""\b(\d{1,3}(?:\.\d{1,3}){3})\b""").find(raw.trim()) ?: return null
-        val ip = match.groupValues[1]
-        val parts = ip.split('.').mapNotNull { it.toIntOrNull() }
-        if (parts.size != 4 || parts.any { it !in 0..255 }) return null
-        return ip
+        val ips = Regex("""\b(\d{1,3}(?:\.\d{1,3}){3})\b""")
+            .findAll(raw.trim())
+            .map { it.groupValues[1] }
+            .filter { ip ->
+                val parts = ip.split('.').mapNotNull { it.toIntOrNull() }
+                parts.size == 4 && parts.all { it in 0..255 }
+            }
+            .toList()
+        if (ips.isEmpty()) return null
+        if (ips.size == 1) return ips[0]
+        return ips.minByOrNull { tetherIpPriority(it) }
+    }
+
+    /** Lower = better match for Pi on phone USB tether. */
+    private fun tetherIpPriority(ip: String): Int = when {
+        ip.startsWith("10.") -> 0
+        ip.startsWith("192.168.42.") || ip.startsWith("192.168.43.") -> 1
+        ip.startsWith("192.168.137.") -> 2
+        ip.startsWith("192.168.4.") -> 9 // Pi wlan on home LAN — wrong for USB-only
+        ip.startsWith("192.168.") -> 5
+        else -> 6
     }
 
     /**

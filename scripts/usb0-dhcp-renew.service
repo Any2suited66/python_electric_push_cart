@@ -1,0 +1,14 @@
+[Unit]
+Description=Renew DHCP on USB tether (usb0)
+# Starts whenever the usb0 net device appears (phone plugged + tethering).
+BindsTo=sys-subsystem-net-devices-usb0.device
+After=sys-subsystem-net-devices-usb0.device network.target
+
+[Service]
+Type=oneshot
+# Install script to /usr/local/bin (see README) or edit this path.
+ExecStart=/usr/local/bin/usb0-dhcp-renew.sh usb0
+TimeoutStartSec=45
+
+[Install]
+WantedBy=sys-subsystem-net-devices-usb0.device

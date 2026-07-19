@@ -48,11 +48,19 @@ SMOOTH_SAMPLES = 5
 WARMUP_FRAMES = 8
 NO_READING_LOST_FRAMES = 3  # hold last distance until this many misses in a row
 
-# Throttle mapping
+# Throttle mapping — continuous PD so the cart can match walking speed.
+# Small deadzone only (true stop near target); derivative term reacts as
+# soon as distance starts changing instead of waiting on a stop-band.
 TARGET_DISTANCE_CM = 200
-DISTANCE_DEADZONE_CM = 15
-MAX_THROTTLE = 400
-MIN_THROTTLE = 50
+DISTANCE_DEADZONE_CM = 18  # settle near target instead of oscillating
+MAX_THROTTLE = 480
+# Proportional: ~cm of range error → throttle units
+KP_THROTTLE = 2.4
+# Derivative: cm/s of range rate → throttle (walk-away feedforward).
+# Keep modest vs P so D doesn't shove past the stop and reverse-hunt.
+KD_THROTTLE = 1.2
+MAX_RANGE_RATE_CMS = 140.0
+MIN_THROTTLE = 35  # soft floor only once command exceeds this
 
 CENTER_POINTS = ((3, 3), (3, 4), (4, 3), (4, 4))
 _Y_LINE_RE = re.compile(r"^Y(\d):\s*(.+)$", re.IGNORECASE)
@@ -140,6 +148,9 @@ class MatrixLidarFollow:
         self._held_distance_cm = 0
         self._held_throttle = 0
         self.reading_held = False
+        self._prev_distance_cm = 0
+        self._prev_distance_time = 0.0
+        self._range_rate_cms = 0.0
         self._last_error: Optional[str] = None
         self._grid_lock = threading.Lock()
         self._latest_buf = [0] * MATRIX_POINTS
@@ -377,6 +388,9 @@ class MatrixLidarFollow:
 
         self.distance_cm = 0
         self.throttle = 0
+        self._prev_distance_cm = 0
+        self._prev_distance_time = 0.0
+        self._range_rate_cms = 0.0
         return 0
 
     def _measure_frame_cm(self) -> int:
@@ -422,18 +436,44 @@ class MatrixLidarFollow:
         frame_cm = int(statistics.median(use_mm) / 10)
         return frame_cm if frame_cm > 0 else 0
 
-    @staticmethod
-    def _throttle_from_distance(distance_cm: int) -> int:
+    def _throttle_from_distance(self, distance_cm: int) -> int:
+        """Continuous PD on range so the cart can match walking speed.
+
+        P holds ~TARGET_DISTANCE_CM. D adds throttle as soon as range starts
+        opening (walk away) and cuts/reverses as range closes — no stop-band
+        wait that caused min-speed stop-and-go.
+        """
+        now = time.time()
         if distance_cm <= 0:
+            self._prev_distance_cm = 0
+            self._prev_distance_time = 0.0
+            self._range_rate_cms = 0.0
             return 0
 
-        error_cm = distance_cm - TARGET_DISTANCE_CM
-        if abs(error_cm) <= DISTANCE_DEADZONE_CM:
-            return MIN_THROTTLE
+        if self._prev_distance_cm > 0 and self._prev_distance_time > 0:
+            dt = max(0.05, min(0.5, now - self._prev_distance_time))
+            raw_rate = (distance_cm - self._prev_distance_cm) / dt
+            raw_rate = max(-MAX_RANGE_RATE_CMS, min(MAX_RANGE_RATE_CMS, raw_rate))
+            self._range_rate_cms = 0.35 * raw_rate + 0.65 * self._range_rate_cms
+        self._prev_distance_cm = distance_cm
+        self._prev_distance_time = now
 
-        ratio = error_cm / TARGET_DISTANCE_CM
-        throttle = int(ratio * MAX_THROTTLE)
-        if 0 < abs(throttle) < MIN_THROTTLE:
+        error_cm = float(distance_cm - TARGET_DISTANCE_CM)
+        if abs(error_cm) <= DISTANCE_DEADZONE_CM:
+            # Still apply derivative so walking off the deadzone starts motion
+            p_term = 0.0
+        else:
+            # Soften deadzone edge (no jump when leaving the band)
+            shrink = DISTANCE_DEADZONE_CM if error_cm > 0 else -DISTANCE_DEADZONE_CM
+            p_term = error_cm - shrink
+
+        throttle = int(KP_THROTTLE * p_term + KD_THROTTLE * self._range_rate_cms)
+        if throttle == 0:
+            return 0
+        if abs(throttle) < MIN_THROTTLE:
+            # Keep fine commands; only floor once we're clearly commanding motion
+            if abs(throttle) < MIN_THROTTLE // 2:
+                return 0
             throttle = MIN_THROTTLE if throttle > 0 else -MIN_THROTTLE
         return max(-MAX_THROTTLE, min(MAX_THROTTLE, throttle))
 
@@ -445,6 +485,7 @@ class MatrixLidarFollow:
                 source = f"usb={self.port}" if self._mode != "i2c" else f"addr=0x{self._addr:02X}"
                 log_cb(
                     f"LiDAR cm={cm} throttle={self.throttle} "
+                    f"rate={self._range_rate_cms:.0f}cm/s "
                     f"valid={self.valid_count} grid={self.grid_valid} "
                     f"min_mm={self.min_mm} {source}"
                 )

@@ -97,10 +97,12 @@ silently while the scan still worked — the symptom of "finds Pi but won't conn
 |-------|-----|
 | Found Pi but Connect fails | Fixed: connect now runs on a background thread (UI-thread socket calls threw `NetworkOnMainThreadException`). The app also tries every discovered host until one holds. Confirm the Pi log shows `Phone connected` and then periodic `📏 dist=…` lines (a held connection), not just quick connect/disconnect pairs (those are scan probes). |
 | Connect failed | USB tethering on? Pi controller running? Firewall allows 9747 |
+| `No Pi on USB :9747. phone=10.x…` | Phone USB is up; Pi is almost always on a **different** `10.x` subnet (stale `usb0`). On Pi: `ip -4 addr show usb0`, then `sudo dhclient -v usb0` (or `sudo ip addr flush dev usb0 && sudo dhclient -v usb0`). Confirm Pi ends on the **same /24** as the phone and `ss -lntp \| grep 9747` shows python listening. Prefer `scripts/usb0-dhcp-renew` so the stale address is flushed automatically. |
+| Dual addresses on `usb0` | `dhclient` can keep e.g. `10.141.179.2` **and** add `10.211.203.224`. Flush (`ip addr flush dev usb0`) then renew, or use the renew script. |
 | Connects from wrong IP (WiFi/cellular) | The scan tries the tether subnet first, but if the phone reaches the Pi over WiFi too, either path works. To force USB only, turn off WiFi/cellular while testing. |
 | No throttle | LiDAR not aimed at torso; check USB port (`ls /dev/ttyACM*`) and mount angle |
 | Steering hunts | Increase `DEADZONE_X` in `CartProtocol.kt` |
-| Wrong Pi IP | Run `hostname -I` on Pi while tethered |
+| Wrong Pi IP | Run `ip -4 addr show usb0` on Pi while tethered (not Wi‑Fi); leave app field blank for auto-scan |
 | "ELF alignment check failed" / not 16 KB compatible | Android 15 16 KB page size. Use CameraX **1.4.2+** and `packaging { jniLibs { useLegacyPackaging = false } }` (already set). Then `./gradlew clean` and rebuild. |
 
 ## Android 15 / 16 KB page size

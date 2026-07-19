@@ -6,17 +6,23 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.hardware.camera2.CameraCharacteristics
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
+import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
+import androidx.camera.core.ZoomState
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleService
+import androidx.lifecycle.Observer
 import com.cartfollow.tracker.BodyCalibrator
 import com.cartfollow.tracker.CalibrationTone
 import com.cartfollow.tracker.CalibStore
@@ -32,6 +38,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.min
 
 /**
  * Keeps camera tracking, GPS, and Pi streaming alive when the screen is off.
@@ -56,6 +63,7 @@ class CartFollowService : LifecycleService() {
     private var cameraProvider: ProcessCameraProvider? = null
     private var analysis: ImageAnalysis? = null
     private var preview: Preview? = null
+    private var camera: Camera? = null
     private var statusListener: ((ServiceStatus) -> Unit)? = null
 
     data class ServiceStatus(
@@ -121,7 +129,12 @@ class CartFollowService : LifecycleService() {
         try {
             provider.unbindAll()
             val cases = mutableListOf(analysis!!, preview!!)
-            provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, *cases.toTypedArray())
+            camera = provider.bindToLifecycle(
+                this,
+                widestBackCameraSelector(),
+                *cases.toTypedArray(),
+            )
+            applyWidestZoom()
         } catch (e: Exception) {
             Log.w(TAG, "Preview attach failed", e)
         }
@@ -133,10 +146,92 @@ class CartFollowService : LifecycleService() {
         val analysisUseCase = analysis ?: return
         try {
             provider.unbindAll()
-            provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, analysisUseCase)
+            camera = provider.bindToLifecycle(
+                this,
+                widestBackCameraSelector(),
+                analysisUseCase,
+            )
+            applyWidestZoom()
         } catch (e: Exception) {
             Log.w(TAG, "Preview detach failed", e)
         }
+    }
+
+    /**
+     * Prefer the back camera that can go widest (lowest min zoom / shortest focal
+     * length). On Fold 5 this is the logical multi-camera; ultra-wide is then
+     * selected with a 0.5× zoom ratio.
+     */
+    @OptIn(ExperimentalCamera2Interop::class)
+    private fun widestBackCameraSelector(): CameraSelector {
+        return CameraSelector.Builder()
+            .requireLensFacing(CameraSelector.LENS_FACING_BACK)
+            .addCameraFilter { cameraInfos ->
+                if (cameraInfos.isEmpty()) return@addCameraFilter cameraInfos
+                val ranked = cameraInfos.sortedWith(
+                    compareBy<androidx.camera.core.CameraInfo> { info ->
+                        info.zoomState.value?.minZoomRatio ?: 1f
+                    }.thenBy { info ->
+                        runCatching {
+                            Camera2CameraInfo.from(info)
+                                .getCameraCharacteristic(
+                                    CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS,
+                                )
+                                ?.minOrNull()
+                        }.getOrNull() ?: Float.MAX_VALUE
+                    },
+                )
+                listOf(ranked.first())
+            }
+            .build()
+    }
+
+    /**
+     * Force ultra-wide on Samsung logical multi-cameras (0.5×) or whatever
+     * [ZoomState.minZoomRatio] allows.
+     */
+    private fun applyWidestZoom() {
+        val cam = camera ?: return
+        val mainExecutor = ContextCompat.getMainExecutor(this)
+
+        fun setWidest(state: ZoomState) {
+            // Fold 5 / Samsung: ultra-wide is selected at ~0.5× on the logical camera.
+            val target = when {
+                state.minZoomRatio <= ULTRA_WIDE_ZOOM_RATIO ->
+                    min(ULTRA_WIDE_ZOOM_RATIO, state.maxZoomRatio)
+                        .coerceAtLeast(state.minZoomRatio)
+                else -> state.minZoomRatio
+            }
+            cam.cameraControl.setZoomRatio(target)
+                .addListener(
+                    {
+                        val applied = cam.cameraInfo.zoomState.value
+                        Log.i(
+                            TAG,
+                            "Camera ultra-wide zoom: requested=$target " +
+                                "applied=${applied?.zoomRatio} " +
+                                "min=${state.minZoomRatio} max=${state.maxZoomRatio}",
+                        )
+                    },
+                    mainExecutor,
+                )
+        }
+
+        val immediate = cam.cameraInfo.zoomState.value
+        if (immediate != null) {
+            setWidest(immediate)
+            return
+        }
+
+        // ZoomState often isn't ready until after the first frame — observe once.
+        val liveData = cam.cameraInfo.zoomState
+        val observer = object : Observer<ZoomState> {
+            override fun onChanged(value: ZoomState) {
+                liveData.removeObserver(this)
+                setWidest(value)
+            }
+        }
+        liveData.observe(this, observer)
     }
 
     fun startCalibration() {
@@ -257,11 +352,12 @@ class CartFollowService : LifecycleService() {
                 }
             }
             provider.unbindAll()
-            provider.bindToLifecycle(
+            camera = provider.bindToLifecycle(
                 this,
-                CameraSelector.DEFAULT_BACK_CAMERA,
+                widestBackCameraSelector(),
                 analysis!!,
             )
+            applyWidestZoom()
         }, ContextCompat.getMainExecutor(this))
     }
 
@@ -549,6 +645,8 @@ class CartFollowService : LifecycleService() {
         private const val FRONT_PREP_SECONDS = 5
         private const val BACK_PREP_SECONDS = 3
         private const val SAMPLE_SECONDS = 5
+        /** Samsung Fold logical multi-camera selects ultra-wide around this ratio. */
+        private const val ULTRA_WIDE_ZOOM_RATIO = 0.5f
 
         const val ACTION_START = "com.cartfollow.action.START"
         const val ACTION_CALIBRATE = "com.cartfollow.action.CALIBRATE"

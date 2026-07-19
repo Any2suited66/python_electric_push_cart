@@ -7,7 +7,10 @@ import kotlin.math.abs
 object TrackQualityGate {
     private const val MIN_LIKELIHOOD = 0.55f
     private const val BODY_FRAC_TOLERANCE = 0.14f
-    private const val CENTER_TOLERANCE_FRAC = 0.22f
+    // Intentionally wide: off-center is what steering corrects. A tight center
+    // check used to drop the track mid-turn → cart stopped ~1–2s then weaved
+    // the other way when the pose re-locked.
+    private const val CENTER_TOLERANCE_FRAC = 0.48f
 
     fun landmarksReliable(
         leftShoulder: PoseLandmark?,
@@ -33,8 +36,12 @@ object TrackQualityGate {
         if (!calibrator.isCalibrated || bodyFrac <= 0f) return true
         val targetBody = calibrator.bestTargetBodyFrac(bodyFrac)
         if (abs(bodyFrac - targetBody) > BODY_FRAC_TOLERANCE) return false
-        val centerTol = frameWidth * CENTER_TOLERANCE_FRAC
-        if (abs(centerX - calibrator.targetCenterX) > centerTol) return false
+        // Only reject someone far outside the frame lane (wrong person), not
+        // normal steering error.
+        if (frameWidth > 0) {
+            val centerTol = frameWidth * CENTER_TOLERANCE_FRAC
+            if (abs(centerX - calibrator.targetCenterX) > centerTol) return false
+        }
         return true
     }
 

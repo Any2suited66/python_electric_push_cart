@@ -70,6 +70,11 @@ class PersonTracker {
                         landmarkCount = 0,
                         colorMatch = false,
                         qualityPass = false,
+                        targetCenterX = if (calibrator.isCalibrated) {
+                            calibrator.targetCenterX
+                        } else {
+                            frameWidth / 2f
+                        },
                     ),
                 )
             }
@@ -106,6 +111,11 @@ class PersonTracker {
                 landmarkCount = pose.allPoseLandmarks.size,
                 colorMatch = false,
                 qualityPass = false,
+                targetCenterX = if (calibrator.isCalibrated) {
+                    calibrator.targetCenterX
+                } else {
+                    frameWidth / 2f
+                },
             )
         }
 
@@ -191,6 +201,7 @@ class PersonTracker {
             landmarkCount = pose.allPoseLandmarks.size,
             colorMatch = colorMatch,
             qualityPass = qualityPass,
+            targetCenterX = targetCenter,
         )
     }
 

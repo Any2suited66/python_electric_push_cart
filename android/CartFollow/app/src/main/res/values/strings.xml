@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Cart Follow</string>
-    <string name="pi_ip_hint">Pi USB IP override (blank = auto; e.g. 10.141.179.71)</string>
+    <string name="pi_ip_hint">Pi USB IP (usb0) — blank = auto; e.g. 10.141.179.2</string>
     <string name="hole_hint">Hole (1–18)</string>
     <string name="scan_connect">Connect to Pi</string>
     <string name="calibrate">Calibrate</string>
