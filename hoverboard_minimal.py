@@ -52,6 +52,9 @@ class MinimalHoverboardController:
         self.lidar_distance_cm = 0
         self.lidar_throttle = 0
         self.distance_source = "none"  # lidar | phone | none
+        # When LiDAR is lost, latch phone "too close" so reverse doesn't
+        # flicker off every time body-size noise crosses the deadzone.
+        self._phone_too_close = False
         self._lidar_thread = None
         self._last_logged_phone_status = None
         self._last_logged_motor_send = None
@@ -82,8 +85,11 @@ class MinimalHoverboardController:
         self.decel_rate = 0.3  # Units per second deceleration rate (reduced for gentler braking)
         # Follow-me must decelerate near-max or it coasts through the target distance
         self.follow_decel_rate = 350.0  # ~emergency_brake_rate; stop instead of overshoot
-        # Match walking: ramp to commanded speed quickly (manual stick still uses accel_rate)
-        self.follow_accel_rate = 55.0
+        # Follow-me accelerates hard for a clear walk-away command, but tapers
+        # near the target so extra responsiveness does not create oscillation.
+        self.follow_accel_rate = 110.0
+        self.follow_accel_rate_near = 40.0
+        self.follow_accel_full_speed = 35.0
         self.steer_rate = 200.0  # Units per second steering rate (INCREASED for responsive turning)
         self.steer_decel_rate = 1000.0  # Units per second steering deceleration (FAST release)
         # Follow-me: slower steer + larger deadzone so standstill pose jitter doesn't weave
@@ -101,7 +107,8 @@ class MinimalHoverboardController:
         # Speed and steering scaling
         # In speed mode, these are raw values sent directly to firmware (not scaled to 1000)
         # Original used max_speed=80, so 50 is already reduced
-        self.max_speed = 80  # Maximum speed (matching original value)
+        self.max_speed = 80  # Manual/controller maximum speed
+        self.follow_max_speed = 110  # Higher ceiling to keep pace while following
         self.max_steering = 120  # Maximum steering (matching original proportion)
         
         # Braking power control (0.0 = no braking, 1.0 = maximum braking)
@@ -798,26 +805,71 @@ class MinimalHoverboardController:
             self.camera_steering = 0
             self.camera_throttle = 0
             self.distance_source = "none"
+            self._phone_too_close = False
             return
 
         self.camera_steering = self.phone_bridge.get_steering()
         phone_throttle = self.phone_bridge.get_throttle()
 
         if self.lidar_distance_cm > 0:
-            # LiDAR PD is primary; phone body-size leads when you start walking
-            # (vision often moves before range leaves the deadzone).
+            # LiDAR owns the absolute distance state. Phone body size can refine
+            # throttle only after LiDAR has selected catch-up or backup; it must
+            # not bypass the requested 2.2/2.35/2.5 m boundaries.
+            self._phone_too_close = False
             lidar_throttle = self.lidar_throttle
             fused = self._fuse_lidar_phone_throttle(lidar_throttle, phone_throttle)
+            motion_state = getattr(self.matrix_lidar, "motion_state", "lost")
+            if motion_state == "hold":
+                # LiDAR neutral band — but if phone clearly says too close, reverse
+                # anyway (LiDAR empty_band / bias often delays metric backup).
+                if phone_throttle <= -25:
+                    fused = self._phone_only_throttle(phone_throttle)
+                else:
+                    fused = 0
+            elif motion_state == "catch_up":
+                fused = max(0, fused)
+            elif motion_state == "backup":
+                fused = min(0, fused)
             self.camera_throttle = fused
             self.distance_source = "fused" if phone_throttle else "lidar"
         else:
-            self.camera_throttle = phone_throttle
-            self.distance_source = "phone" if phone_throttle != 0 else "none"
+            # LiDAR lost: phone body-size with a latched "too close" reverse
+            # signal (same idea as sustained forward catch-up).
+            self.camera_throttle = self._phone_only_throttle(phone_throttle)
+            self.distance_source = "phone" if self.camera_throttle != 0 else "none"
+
+    def _phone_only_throttle(self, phone_throttle: int) -> int:
+        """Phone body-size throttle with latched reverse while LiDAR is lost.
+
+        Forward already stays on while the torso looks small. Reverse used to
+        drop out whenever bodyFrac flickered through the deadzone — latch
+        "too close" until the phone clearly reports too-far / catch-up.
+        """
+        floor = 140  # match LiDAR MIN_THROTTLE so reverse clears motor deadzone
+        enter_rev = -25  # latch from a weak "too close" so reverse starts sooner
+        exit_rev = 50  # need a clear "too far" before releasing reverse
+
+        if phone_throttle <= enter_rev:
+            self._phone_too_close = True
+        elif phone_throttle >= exit_rev:
+            self._phone_too_close = False
+
+        if self._phone_too_close:
+            # Hold decisive reverse even if phoneT is briefly 0 in the deadzone.
+            if phone_throttle < 0:
+                return max(-512, min(-floor, phone_throttle))
+            return -floor
+
+        if phone_throttle == 0:
+            return 0
+        if phone_throttle > 0 and abs(phone_throttle) < floor and abs(phone_throttle) >= 40:
+            return floor
+        return max(-512, min(512, phone_throttle))
 
     @staticmethod
     def _fuse_lidar_phone_throttle(lidar_throttle: int, phone_throttle: int) -> int:
         """Blend range (LiDAR) with body-size (phone) for smoother speed matching."""
-        max_t = 480
+        max_t = 512
         if phone_throttle == 0:
             return max(-max_t, min(max_t, lidar_throttle))
 
@@ -887,11 +939,13 @@ class MinimalHoverboardController:
                 self.matrix_lidar = sensor
                 if sensor.i2c_addr:
                     self.debug_print(
-                        f"✓ Matrix LiDAR ready (I2C 0x{sensor.i2c_addr:02X}) target=200cm"
+                        f"✓ Matrix LiDAR ready (I2C 0x{sensor.i2c_addr:02X}) "
+                        "reverse<220cm forward>250cm max-gap≈350cm"
                     )
                 else:
                     self.debug_print(
-                        f"✓ Matrix LiDAR ready (USB {sensor.port}) target=200cm"
+                        f"✓ Matrix LiDAR ready (USB {sensor.port}) "
+                        "reverse<220cm forward>250cm max-gap≈350cm"
                     )
             else:
                 self.debug_print(f"✗ Matrix LiDAR: {sensor.last_error}")
@@ -947,6 +1001,7 @@ class MinimalHoverboardController:
                     self.camera_throttle,
                     self.distance_source,
                     self.lidar_distance_cm // 10 if self.lidar_distance_cm else 0,
+                    getattr(self.matrix_lidar, "motion_state", "lost"),
                 )
                 if status_key != self._last_logged_phone_status:
                     self._last_logged_phone_status = status_key
@@ -960,7 +1015,15 @@ class MinimalHoverboardController:
                         and self.lidar_distance_cm > 0
                         and getattr(self.matrix_lidar, "reading_held", False)
                     ):
-                        lidar_txt += " hold"
+                        lidar_txt += " sample-held"
+                    if self.matrix_lidar and self.lidar_distance_cm <= 0:
+                        miss = getattr(self.matrix_lidar, "miss_reason", "") or "?"
+                        age = getattr(self.matrix_lidar, "frame_age_s", 0.0)
+                        lidar_txt += f" miss={miss} age={age:.2f}s"
+                    if self.matrix_lidar:
+                        lidar_txt += (
+                            f" state={getattr(self.matrix_lidar, 'motion_state', 'lost')}"
+                        )
                     follow_txt = (
                         "ON" if self.follow_me_mode == 1 else "OFF (enable on remote)"
                     )
@@ -1250,6 +1313,11 @@ class MinimalHoverboardController:
             self.last_cruise_state = self.cruise_control
             
         steering_norm = self.steering / 512.0
+        speed_limit = (
+            self.follow_max_speed
+            if self.follow_me_mode == 1
+            else self.max_speed
+        )
         
         # In speed mode:
         #   - Positive throttle = forward speed
@@ -1257,14 +1325,20 @@ class MinimalHoverboardController:
         #   - Negative throttle when stopped/backward = reverse speed
         # Behavior is automatic based on current motion state
         
-        # Apply deadzone to normalized inputs (but NOT for cruise control throttle)
+        # Apply joystick throttle deadzone only in manual mode. Follow-me
+        # throttle is deliberate LiDAR/phone controller output and already has
+        # its own hold state and minimum-command threshold.
         throttle_deadzone = 0.10
         steering_deadzone = (
             self.follow_steering_deadzone
             if self.follow_me_mode == 1
             else 0.06
         )
-        if not self.cruise_control and abs(throttle_norm) < throttle_deadzone:
+        if (
+            self.follow_me_mode != 1
+            and not self.cruise_control
+            and abs(throttle_norm) < throttle_deadzone
+        ):
             throttle_norm = 0
         if abs(steering_norm) < steering_deadzone:
             steering_norm = 0
@@ -1283,7 +1357,7 @@ class MinimalHoverboardController:
         # If stopped/backward, negative throttle will create reverse speed
         # Don't block negative throttle here - let braking section handle it intelligently
         
-        scaled_speed = throttle_norm * self.max_speed * speed_multiplier
+        scaled_speed = throttle_norm * speed_limit * speed_multiplier
         scaled_steering = steering_norm * self.max_steering * steering_multiplier
         
         # Tank-style mixing with separate scaling
@@ -1354,9 +1428,16 @@ class MinimalHoverboardController:
         speed_diff = target_speed - self.current_speed
         steer_diff = target_steer - self.current_steering
         
-        # Choose acceleration or deceleration rate
+        # Choose acceleration or deceleration rate. A direction reversal must
+        # decelerate through zero first; treating it as acceleration can turn
+        # small distance corrections into forward/reverse oscillation.
         if abs(speed_diff) > 0.1:
-            if abs(target_speed) < abs(self.current_speed):
+            changing_direction = (
+                abs(self.current_speed) > 0.5
+                and abs(target_speed) > 0.5
+                and self.current_speed * target_speed < 0
+            )
+            if changing_direction or abs(target_speed) < abs(self.current_speed):
                 # Decelerating — follow-me needs real braking, not the gentle manual coast
                 decel = (
                     self.follow_decel_rate
@@ -1365,12 +1446,18 @@ class MinimalHoverboardController:
                 )
                 max_speed_change = decel * dt
             else:
-                # Accelerating — follow-me needs faster ramp to match walking
-                accel = (
-                    self.follow_accel_rate
-                    if self.follow_me_mode == 1
-                    else self.accel_rate
-                )
+                if self.follow_me_mode == 1:
+                    # Scale from a gentle near-target ramp to full acceleration.
+                    # target_speed already represents the fused LiDAR/phone demand.
+                    demand = min(
+                        1.0,
+                        abs(target_speed) / self.follow_accel_full_speed,
+                    )
+                    accel = self.follow_accel_rate_near + demand * (
+                        self.follow_accel_rate - self.follow_accel_rate_near
+                    )
+                else:
+                    accel = self.accel_rate
                 max_speed_change = accel * dt
             
             # Limit speed change
@@ -1441,7 +1528,7 @@ class MinimalHoverboardController:
                 elif abs(speed) < 50 and abs(self.throttle) > throttle_deadzone_turn:
                     # Turning with throttle input but low calculated speed - apply proportional floor,
                     # but never exceed the driver's requested speed
-                    desired_speed_mag = (abs(self.throttle) / 512.0) * self.max_speed
+                    desired_speed_mag = (abs(self.throttle) / 512.0) * speed_limit
                     steer_ratio = min(1.0, abs(steer) / float(self.max_steering or 1))
                     min_turn_speed = desired_speed_mag * steer_ratio  # proportional to steering effort
                     min_turn_speed = min(min_turn_speed, desired_speed_mag)
@@ -1460,8 +1547,8 @@ class MinimalHoverboardController:
                 if throttle_neutral:
                     # User released stick to neutral: apply single strong brake pulse then exit
                     brake_strength = min(
-                        max(abs(self.current_speed) * (self.brake_gain * 8), self.max_speed * 0.15),
-                        self.max_speed * max(0.3, self.brake_max_ratio * 2)
+                        max(abs(self.current_speed) * (self.brake_gain * 8), speed_limit * 0.15),
+                        speed_limit * max(0.3, self.brake_max_ratio * 2)
                     )
                     speed = -int(math.copysign(brake_strength, self.current_speed))
                     self.direction_change_target_sign = 0
@@ -1474,8 +1561,8 @@ class MinimalHoverboardController:
                 elif abs(self.current_speed) > self.direction_change_release_threshold:
                     # Apply strong braking opposite current motion regardless of joystick command
                     brake_strength = min(
-                        max(abs(self.current_speed) * (self.brake_gain * 8), self.max_speed * 0.15),
-                        self.max_speed * max(0.3, self.brake_max_ratio * 2)
+                        max(abs(self.current_speed) * (self.brake_gain * 8), speed_limit * 0.15),
+                        speed_limit * max(0.3, self.brake_max_ratio * 2)
                     )
                     speed = -int(math.copysign(brake_strength, self.current_speed))
                     if self.debug_mode:
@@ -1504,8 +1591,8 @@ class MinimalHoverboardController:
                     # Pulling back while moving forward = apply negative speed (braking)
                     if follow_brake:
                         brake_strength = min(
-                            max(abs(self.current_speed) * 0.9, self.max_speed * 0.35),
-                            self.max_speed * 0.85,
+                            max(abs(self.current_speed) * 0.9, speed_limit * 0.35),
+                            speed_limit * 0.85,
                         )
                     else:
                         brake_strength = min(
@@ -1524,8 +1611,8 @@ class MinimalHoverboardController:
                     # Joystick released / follow deadzone while moving = brake
                     if follow_brake:
                         brake_strength = min(
-                            max(abs(self.current_speed) * 0.9, self.max_speed * 0.35),
-                            self.max_speed * 0.85,
+                            max(abs(self.current_speed) * 0.9, speed_limit * 0.35),
+                            speed_limit * 0.85,
                         )
                     else:
                         brake_strength = min(
@@ -1558,7 +1645,7 @@ class MinimalHoverboardController:
                 # Speed mode: clamp to max_speed and send directly (no scaling)
                 # This matches the original behavior where max_speed=80 meant 80 units, not 1000
                 steer_scaled = int(max(-300, min(300, steer)))  # Match max_steering for responsive turns
-                speed_scaled = int(max(-self.max_speed, min(self.max_speed, speed)))  # Use max_speed directly
+                speed_scaled = int(max(-speed_limit, min(speed_limit, speed)))
                 
                 # Safety: Never send speed=0 unless joystick is truly at neutral
                 if abs(speed_scaled) < 5 and abs(self.throttle) > throttle_deadzone and not steering_active:
@@ -1572,8 +1659,8 @@ class MinimalHoverboardController:
                         self.debug_print(f"⚠️ Prevented accidental brake: ThrottleRaw={self.throttle}, setting min speed={speed_scaled}")
             else:
                 # Torque mode: scale to -1000 to +1000 range
-                if self.max_speed > 0:
-                    speed_scaled = int((speed / self.max_speed) * 1000)
+                if speed_limit > 0:
+                    speed_scaled = int((speed / speed_limit) * 1000)
                 else:
                     speed_scaled = 0
                 

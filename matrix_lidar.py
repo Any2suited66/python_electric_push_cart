@@ -38,29 +38,58 @@ RP2040_VID = "2E8A"
 USB_FRAME_TIMEOUT_S = 3.0
 
 # Follow-me LiDAR filtering (person blob + stall logic)
-FOLLOW_MIN_MM = 300
-FOLLOW_MAX_MM = 3500
-PERSON_Y_MIN = 1
-PERSON_Y_MAX = 5
-FLOOR_Y_MIN = 6
-MIN_VALID_CELLS = 3
+FOLLOW_MIN_MM = 600
+FOLLOW_MAX_MM = 4000
+# Wider vertical band — logs showed empty_band on Y1–5 most of the walk.
+PERSON_Y_MIN = 0
+PERSON_Y_MAX = 6
 SMOOTH_SAMPLES = 5
 WARMUP_FRAMES = 8
-NO_READING_LOST_FRAMES = 3  # hold last distance until this many misses in a row
+# Hold last good range through brief torso-band / USB misses (~1.2 s at 10 Hz).
+NO_READING_LOST_FRAMES = 12
+# USB 8x8 stream is stale if no committed frame arrives within this window.
+USB_FRAME_STALE_S = 0.45
+# Person = nearest blob in the torso band. Cells within this window of the
+# nearest valid cell count as the person; anything farther is background.
+PERSON_BLOB_WINDOW_MM = 400
+MIN_BLOB_CELLS = 2
+# At follow distance an 8x8 often lights only one torso cell — allow it when far.
+FAR_SINGLE_CELL_MM = 1500
+# Reject single-frame flashes (floor/wall) that jump farther than this from hold.
+MAX_FRAME_JUMP_CM = 55
 
-# Throttle mapping — continuous PD so the cart can match walking speed.
-# Small deadzone only (true stop near target); derivative term reacts as
-# soon as distance starts changing instead of waiting on a stop-band.
-TARGET_DISTANCE_CM = 200
-DISTANCE_DEADZONE_CM = 18  # settle near target instead of oscillating
-MAX_THROTTLE = 480
-# Proportional: ~cm of range error → throttle units
-KP_THROTTLE = 2.4
-# Derivative: cm/s of range rate → throttle (walk-away feedforward).
-# Keep modest vs P so D doesn't shove past the stop and reverse-hunt.
-KD_THROTTLE = 1.2
+# Absolute follow-distance state thresholds.
+# Reverse protects personal space; forward catch-up has a separate band.
+BACKUP_START_DISTANCE_CM = 220
+BACKUP_STOP_DISTANCE_CM = 235
+FORWARD_STOP_DISTANCE_CM = 240
+FORWARD_START_DISTANCE_CM = 250
+# While walking, catch-up authority rises with the gap and gets an extra boost
+# past this soft maximum so the cart works to stay within about 3.5 m.
+WALKING_MAX_GAP_CM = 350
+MAX_THROTTLE = 512
+# P corrects accumulated spacing error; D matches the user's range rate.
+KP_THROTTLE = 2.0
+KD_THROTTLE = 1.4
+FAR_GAP_BOOST_KP = 2.0
 MAX_RANGE_RATE_CMS = 140.0
-MIN_THROTTLE = 35  # soft floor only once command exceeds this
+RANGE_RATE_DEADZONE_CMS = 6.0
+# Floor for any active correction. With follow_max_speed=110, raw 140 scales
+# to ~30 motor units so catch-up/reverse starts decisively instead of creeping.
+MIN_THROTTLE = 140
+MIN_COMMAND_THROTTLE = 8
+# After a correction settles into HOLD, don't start the opposite correction
+# for this long — the cart's stopping overshoot (~10–25 cm) otherwise walks
+# it across the narrow neutral band and back, oscillating ±0.25 m.
+DIRECTION_FLIP_LOCKOUT_S = 1.5
+# Personal space always wins: inside this distance backup starts regardless
+# of the lockout.
+BACKUP_OVERRIDE_DISTANCE_CM = 200
+
+FOLLOW_LOST = "lost"
+FOLLOW_HOLD = "hold"
+FOLLOW_CATCH_UP = "catch_up"
+FOLLOW_BACKUP = "backup"
 
 CENTER_POINTS = ((3, 3), (3, 4), (4, 3), (4, 4))
 _Y_LINE_RE = re.compile(r"^Y(\d):\s*(.+)$", re.IGNORECASE)
@@ -148,12 +177,18 @@ class MatrixLidarFollow:
         self._held_distance_cm = 0
         self._held_throttle = 0
         self.reading_held = False
+        self.miss_reason = ""
+        self.frame_age_s = 0.0
         self._prev_distance_cm = 0
         self._prev_distance_time = 0.0
         self._range_rate_cms = 0.0
+        self.motion_state = FOLLOW_LOST
+        self._last_correction = ""
+        self._hold_since = 0.0
         self._last_error: Optional[str] = None
         self._grid_lock = threading.Lock()
         self._latest_buf = [0] * MATRIX_POINTS
+        self._last_frame_time = 0.0
         self._reader_thread: Optional[threading.Thread] = None
         self._reader_running = False
         self._first_frame = threading.Event()
@@ -264,6 +299,7 @@ class MatrixLidarFollow:
                 buf[y * MATRIX_SIZE + x] = row[x] if x < len(row) else 0
         with self._grid_lock:
             self._latest_buf = buf
+            self._last_frame_time = time.time()
         self._first_frame.set()
 
     def _usb_reader_loop(self) -> None:
@@ -339,17 +375,25 @@ class MatrixLidarFollow:
             buf.extend([0] * (MATRIX_POINTS - len(buf)))
         return buf[:MATRIX_POINTS]
 
-    def _grid_snapshot(self) -> list[int]:
+    def _grid_snapshot(self) -> tuple[list[int], float]:
+        """Return (grid, age_s). age_s is 0 for fresh I2C reads."""
         if self._mode == "i2c":
             if not self.connected or self._sensor is None:
-                return [0] * MATRIX_POINTS
+                return [0] * MATRIX_POINTS, 999.0
             raw = self._sensor.get_all_data()
             if not raw:
-                return [0] * MATRIX_POINTS
-            return self._decode_grid(raw)
+                return [0] * MATRIX_POINTS, 999.0
+            with self._grid_lock:
+                self._last_frame_time = time.time()
+            return self._decode_grid(raw), 0.0
 
         with self._grid_lock:
-            return list(self._latest_buf)
+            age = (
+                time.time() - self._last_frame_time
+                if self._last_frame_time > 0
+                else 999.0
+            )
+            return list(self._latest_buf), age
 
     def read_distance_cm(self) -> int:
         self.valid_count = 0
@@ -357,15 +401,30 @@ class MatrixLidarFollow:
         self.min_mm = 0
         self.center_mm = [0, 0, 0, 0]
         self.reading_held = False
+        self.miss_reason = ""
+        self.frame_age_s = 0.0
 
         if not self.connected:
             self.distance_cm = 0
             self.throttle = 0
+            self.miss_reason = "disconnected"
+            self._reset_motion_control()
             return 0
 
-        frame_cm = self._measure_frame_cm()
+        frame_cm, reason = self._measure_frame_cm()
+        self.miss_reason = reason
+        if frame_cm > 0:
+            # Soft spike reject: one wild flash vs held range is treated as a miss.
+            if (
+                self._held_distance_cm > 0
+                and abs(frame_cm - self._held_distance_cm) > MAX_FRAME_JUMP_CM
+            ):
+                self.miss_reason = "jump"
+                frame_cm = 0
+
         if frame_cm > 0:
             self._miss_streak = 0
+            self.miss_reason = ""
             self._smooth_buf.append(frame_cm)
             if len(self._smooth_buf) > SMOOTH_SAMPLES:
                 self._smooth_buf.pop(0)
@@ -388,66 +447,121 @@ class MatrixLidarFollow:
 
         self.distance_cm = 0
         self.throttle = 0
+        self._reset_motion_control()
+        return 0
+
+    def _reset_motion_control(self) -> None:
+        """Reset range-rate history and require a fresh state acquisition."""
         self._prev_distance_cm = 0
         self._prev_distance_time = 0.0
         self._range_rate_cms = 0.0
-        return 0
+        self.motion_state = FOLLOW_LOST
+        self._last_correction = ""
+        self._hold_since = 0.0
 
-    def _measure_frame_cm(self) -> int:
-        """Raw per-frame distance (0 = no valid torso band this tick)."""
-        buf = self._grid_snapshot()
+    def _measure_frame_cm(self) -> tuple[int, str]:
+        """Nearest torso-band blob distance, or (0, miss_reason).
+
+        The person is the nearest coherent object in the band. Background
+        cells behind them are excluded so a 2.2 m person is not read as a
+        farther wall.
+        """
+        buf, age = self._grid_snapshot()
+        self.frame_age_s = age
+        if self._mode != "i2c" and age > USB_FRAME_STALE_S:
+            return 0, "usb_stale"
         if not any(buf):
-            return 0
+            return 0, "empty_grid"
 
         for i, (x, y) in enumerate(CENTER_POINTS):
             self.center_mm[i] = buf[y * MATRIX_SIZE + x]
 
         band_mm: list[int] = []
-        center_mm: list[int] = []
-        floor_count = 0
-
-        for y in range(MATRIX_SIZE):
+        for y in range(PERSON_Y_MIN, PERSON_Y_MAX + 1):
             for x in range(MATRIX_SIZE):
                 distance_mm = buf[y * MATRIX_SIZE + x]
-                if not self._follow_valid(distance_mm):
-                    continue
-                self.grid_valid += 1
-                if y >= FLOOR_Y_MIN:
-                    floor_count += 1
-                if PERSON_Y_MIN <= y <= PERSON_Y_MAX:
+                if self._follow_valid(distance_mm):
                     band_mm.append(distance_mm)
-                if (x, y) in CENTER_POINTS:
-                    center_mm.append(distance_mm)
+        self.grid_valid = len(band_mm)
 
-        if len(center_mm) >= 2:
-            use_mm = center_mm
-        elif len(band_mm) >= MIN_VALID_CELLS:
-            use_mm = band_mm
-        elif band_mm and floor_count == 0:
-            use_mm = band_mm
+        if not band_mm:
+            return 0, "empty_band"
+
+        nearest = min(band_mm)
+        blob = [d for d in band_mm if d - nearest <= PERSON_BLOB_WINDOW_MM]
+        min_cells = 1 if nearest >= FAR_SINGLE_CELL_MM else MIN_BLOB_CELLS
+        if len(blob) < min_cells:
+            return 0, "blob_small"
+
+        self.valid_count = len(blob)
+        self.min_mm = nearest
+        frame_cm = int(statistics.median(blob) / 10)
+        if frame_cm <= 0:
+            return 0, "empty_band"
+        return frame_cm, ""
+
+    def _flip_locked(self, wanted_state: str, now: float) -> bool:
+        """True while the opposite correction is still in its settle lockout.
+
+        Stopping overshoot (~10–25 cm) can carry the cart across the neutral
+        band right after a correction ends; without this it ping-pongs
+        backup ↔ catch_up about ±0.25 m.
+        """
+        if self._last_correction in ("", wanted_state):
+            return False
+        return (now - self._hold_since) < DIRECTION_FLIP_LOCKOUT_S
+
+    def _update_motion_state(self, distance_cm: float) -> None:
+        """Select one stable motion state from absolute distance thresholds."""
+        now = time.time()
+        previous_state = self.motion_state
+        if self.motion_state == FOLLOW_LOST:
+            if distance_cm > FORWARD_START_DISTANCE_CM:
+                self.motion_state = FOLLOW_CATCH_UP
+            elif distance_cm <= BACKUP_START_DISTANCE_CM:
+                self.motion_state = FOLLOW_BACKUP
+            else:
+                self.motion_state = FOLLOW_HOLD
+        elif self.motion_state == FOLLOW_HOLD:
+            if distance_cm > FORWARD_START_DISTANCE_CM and not self._flip_locked(
+                FOLLOW_CATCH_UP, now
+            ):
+                self.motion_state = FOLLOW_CATCH_UP
+            elif distance_cm <= BACKUP_START_DISTANCE_CM and (
+                distance_cm <= BACKUP_OVERRIDE_DISTANCE_CM
+                or not self._flip_locked(FOLLOW_BACKUP, now)
+            ):
+                self.motion_state = FOLLOW_BACKUP
+        elif self.motion_state == FOLLOW_CATCH_UP:
+            if distance_cm <= BACKUP_START_DISTANCE_CM:
+                self.motion_state = FOLLOW_BACKUP
+            elif distance_cm <= FORWARD_STOP_DISTANCE_CM:
+                # Keep chasing while the gap is still growing (user walking away).
+                # Stopping here caused stop-go at ~2.4 m during a normal walk.
+                if self._range_rate_cms <= RANGE_RATE_DEADZONE_CMS:
+                    self.motion_state = FOLLOW_HOLD
+        elif self.motion_state == FOLLOW_BACKUP:
+            if distance_cm >= BACKUP_STOP_DISTANCE_CM:
+                self.motion_state = FOLLOW_HOLD
         else:
-            return 0
+            self.motion_state = FOLLOW_LOST
 
-        if not use_mm:
-            return 0
-
-        self.valid_count = len(use_mm)
-        self.min_mm = min(use_mm)
-        frame_cm = int(statistics.median(use_mm) / 10)
-        return frame_cm if frame_cm > 0 else 0
+        # Do not carry catch-up/backup momentum through HOLD and turn it into
+        # an immediate opposite command. Motor deceleration handles the stop;
+        # fresh range-rate samples can then match new user movement.
+        if (
+            self.motion_state == FOLLOW_HOLD
+            and previous_state in (FOLLOW_CATCH_UP, FOLLOW_BACKUP)
+        ):
+            self._range_rate_cms = 0.0
+            self._last_correction = previous_state
+            self._hold_since = now
 
     def _throttle_from_distance(self, distance_cm: int) -> int:
-        """Continuous PD on range so the cart can match walking speed.
-
-        P holds ~TARGET_DISTANCE_CM. D adds throttle as soon as range starts
-        opening (walk away) and cuts/reverses as range closes — no stop-band
-        wait that caused min-speed stop-and-go.
-        """
+        """Stateful PD: stable spacing correction plus walking-speed matching."""
         now = time.time()
         if distance_cm <= 0:
-            self._prev_distance_cm = 0
-            self._prev_distance_time = 0.0
-            self._range_rate_cms = 0.0
+            self._reset_motion_control()
             return 0
 
         if self._prev_distance_cm > 0 and self._prev_distance_time > 0:
@@ -458,22 +572,52 @@ class MatrixLidarFollow:
         self._prev_distance_cm = distance_cm
         self._prev_distance_time = now
 
-        error_cm = float(distance_cm - TARGET_DISTANCE_CM)
-        if abs(error_cm) <= DISTANCE_DEADZONE_CM:
-            # Still apply derivative so walking off the deadzone starts motion
-            p_term = 0.0
-        else:
-            # Soften deadzone edge (no jump when leaving the band)
-            shrink = DISTANCE_DEADZONE_CM if error_cm > 0 else -DISTANCE_DEADZONE_CM
-            p_term = error_cm - shrink
+        self._update_motion_state(float(distance_cm))
 
-        throttle = int(KP_THROTTLE * p_term + KD_THROTTLE * self._range_rate_cms)
-        if throttle == 0:
+        # P is measured from each correction's stop threshold. This creates
+        # hysteresis without driving while inside the neutral 2.35–2.5 m band.
+        if self.motion_state == FOLLOW_CATCH_UP:
+            p_error = max(0.0, distance_cm - FORWARD_STOP_DISTANCE_CM)
+        elif self.motion_state == FOLLOW_BACKUP:
+            p_error = min(0.0, distance_cm - BACKUP_STOP_DISTANCE_CM)
+        else:
+            p_error = 0.0
+
+        # Ignore tiny range-rate noise. D becomes active after catch-up/backup
+        # starts, allowing the cart to match walking speed during that motion.
+        if abs(self._range_rate_cms) <= RANGE_RATE_DEADZONE_CMS:
+            range_rate = 0.0
+        else:
+            range_rate = self._range_rate_cms - (
+                RANGE_RATE_DEADZONE_CMS
+                if self._range_rate_cms > 0
+                else -RANGE_RATE_DEADZONE_CMS
+            )
+
+        if self.motion_state == FOLLOW_HOLD:
+            # Respect the requested absolute start thresholds. Once a correction
+            # starts, D remains active to match the user's walking speed.
+            throttle = 0
+        else:
+            throttle = int(KP_THROTTLE * p_error + KD_THROTTLE * range_rate)
+            if (
+                self.motion_state == FOLLOW_CATCH_UP
+                and distance_cm > WALKING_MAX_GAP_CM
+            ):
+                throttle += int(
+                    FAR_GAP_BOOST_KP * (distance_cm - WALKING_MAX_GAP_CM)
+                )
+
+        # A correction state cannot command the opposite direction. It can
+        # reduce to zero and let the strong motor deceleration stop the cart.
+        if self.motion_state == FOLLOW_CATCH_UP:
+            throttle = max(0, throttle)
+        elif self.motion_state == FOLLOW_BACKUP:
+            throttle = min(0, throttle)
+
+        if abs(throttle) < MIN_COMMAND_THROTTLE:
             return 0
         if abs(throttle) < MIN_THROTTLE:
-            # Keep fine commands; only floor once we're clearly commanding motion
-            if abs(throttle) < MIN_THROTTLE // 2:
-                return 0
             throttle = MIN_THROTTLE if throttle > 0 else -MIN_THROTTLE
         return max(-MAX_THROTTLE, min(MAX_THROTTLE, throttle))
 
@@ -481,12 +625,26 @@ class MatrixLidarFollow:
         """Background loop: call running_cb() until it returns False."""
         while running_cb():
             cm = self.read_distance_cm()
-            if log_cb and cm > 0:
-                source = f"usb={self.port}" if self._mode != "i2c" else f"addr=0x{self._addr:02X}"
-                log_cb(
-                    f"LiDAR cm={cm} throttle={self.throttle} "
-                    f"rate={self._range_rate_cms:.0f}cm/s "
-                    f"valid={self.valid_count} grid={self.grid_valid} "
-                    f"min_mm={self.min_mm} {source}"
+            if log_cb:
+                source = (
+                    f"usb={self.port}"
+                    if self._mode != "i2c"
+                    else f"addr=0x{self._addr:02X}"
                 )
+                if cm > 0:
+                    held = " sample-held" if self.reading_held else ""
+                    miss = f" miss={self.miss_reason}" if self.miss_reason else ""
+                    log_cb(
+                        f"LiDAR cm={cm} throttle={self.throttle} "
+                        f"state={self.motion_state} rate={self._range_rate_cms:.0f}cm/s "
+                        f"valid={self.valid_count} grid={self.grid_valid} "
+                        f"min_mm={self.min_mm} age={self.frame_age_s:.2f}s"
+                        f"{held}{miss} {source}"
+                    )
+                elif self.miss_reason:
+                    log_cb(
+                        f"LiDAR no-reading miss={self.miss_reason} "
+                        f"age={self.frame_age_s:.2f}s streak={self._miss_streak} "
+                        f"{source}"
+                    )
             time.sleep(interval_s)

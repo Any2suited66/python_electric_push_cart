@@ -302,6 +302,14 @@ class CartFollowService : LifecycleService() {
         if (!piConnected.getAndSet(false)) return
         streaming.set(false)
         calibrating.set(false)
+        gpsTracker.stop()
+        motionAssist.stop()
+        tracker.resetSmoothing()
+        ContextCompat.getMainExecutor(this).execute {
+            if (!piConnected.get()) {
+                cameraProvider?.unbindAll()
+            }
+        }
         try {
             piClient?.disconnect()
         } catch (_: Exception) {
@@ -322,6 +330,10 @@ class CartFollowService : LifecycleService() {
         future.addListener({
             val provider = future.get()
             cameraProvider = provider
+            if (!piConnected.get()) {
+                provider.unbindAll()
+                return@addListener
+            }
             analysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .build()

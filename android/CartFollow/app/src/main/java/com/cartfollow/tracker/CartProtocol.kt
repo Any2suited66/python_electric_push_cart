@@ -23,12 +23,23 @@ object CartProtocol {
     const val DEADZONE_X_FRAC = 0.08f
 
     // Backup distance control (used only when the Pi LiDAR has no valid reading).
-    // Torso height as a fraction of frame height at the desired follow distance.
-    // Bigger torso = closer. Tune TARGET_BODY_FRAC for your mount + follow distance.
-    const val TARGET_BODY_FRAC = 0.33f
-    const val BODY_DEADZONE_FRAC = 0.03f
+    // Ultra-wide makes the torso look smaller at the same physical distance, so
+    // these fracs are lower than a normal FOV would need. Bigger torso = closer.
+    const val TARGET_BODY_FRAC = 0.24f
+    const val BODY_DEADZONE_FRAC = 0.025f
+    // Absolute "too close" band: reverse starts before you look huge in frame,
+    // and stays on until the torso shrinks again (continuous reverse signal).
+    const val REVERSE_ENTER_BODY_FRAC = 0.22f
+    const val REVERSE_EXIT_BODY_FRAC = 0.18f
     const val MAX_BACKUP_THROTTLE = 320 // closer to LiDAR authority when fused
     const val MIN_THROTTLE = 40
+
+    @Volatile
+    private var reverseLatched: Boolean = false
+
+    fun resetThrottleLatch() {
+        reverseLatched = false
+    }
 
     fun buildPacket(
         steering: Int,
@@ -85,13 +96,34 @@ object CartProtocol {
     }
 
     fun throttleFromBodyFraction(bodyFrac: Float, targetBodyFrac: Float = TARGET_BODY_FRAC): Int {
-        if (bodyFrac <= 0f) return 0
-        val error = targetBodyFrac - bodyFrac
+        if (bodyFrac <= 0f) {
+            reverseLatched = false
+            return 0
+        }
+
+        // Absolute too-close band (independent of the forward deadzone) so reverse
+        // starts around follow distance on ultra-wide, not only when you're on top
+        // of the cart.
+        if (bodyFrac >= REVERSE_ENTER_BODY_FRAC) {
+            reverseLatched = true
+        } else if (bodyFrac <= REVERSE_EXIT_BODY_FRAC) {
+            reverseLatched = false
+        }
+
+        if (reverseLatched) {
+            val closeError = targetBodyFrac - kotlin.math.max(bodyFrac, REVERSE_ENTER_BODY_FRAC)
+            val ratio = closeError / targetBodyFrac
+            var throttle = (ratio * MAX_BACKUP_THROTTLE).toInt()
+            if (throttle >= 0) throttle = -MIN_THROTTLE
+            if (kotlin.math.abs(throttle) < MIN_THROTTLE) throttle = -MIN_THROTTLE
+            return throttle.coerceIn(-MAX_BACKUP_THROTTLE, -MIN_THROTTLE)
+        }
+
+        val error = targetBodyFrac - bodyFrac // + = too far → forward
         if (kotlin.math.abs(error) <= BODY_DEADZONE_FRAC) return 0
         val ratio = error / targetBodyFrac
         var throttle = (ratio * MAX_BACKUP_THROTTLE).toInt()
         if (throttle != 0 && kotlin.math.abs(throttle) < MIN_THROTTLE) {
-            // Soft floor: tiny errors stay 0 so fusion doesn't inject creep
             if (kotlin.math.abs(throttle) < MIN_THROTTLE / 2) return 0
             throttle = if (throttle > 0) MIN_THROTTLE else -MIN_THROTTLE
         }
